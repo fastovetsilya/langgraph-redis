@@ -120,6 +120,34 @@ def test_cluster_connection():
             ping_result = saver._redis.ping()
             print(f"✅ Ping successful: {ping_result}")
             
+            # Step 4a: Debug cluster mode detection 
+            print("Step 4a: Debugging cluster mode detection...")
+            print(f"  - saver.cluster_mode: {getattr(saver, 'cluster_mode', 'NOT_SET')}")
+            print(f"  - Redis client type: {type(saver._redis)}")
+            print(f"  - Is RedisCluster: {isinstance(saver._redis, type(saver._redis).__bases__[0] if hasattr(type(saver._redis), '__bases__') else False)}")
+            
+            # Check if this is actually a cluster by trying cluster info
+            try:
+                from redis.cluster import RedisCluster
+                if isinstance(saver._redis, RedisCluster):
+                    cluster_info = saver._redis.cluster("info")
+                    print(f"  - Cluster info available: {cluster_info[:100]}...")
+                    print("  - ✅ This is definitely a Redis cluster")
+                else:
+                    print("  - ⚠️ Client is not a RedisCluster instance")
+                    try:
+                        # Try cluster info anyway in case it's a cluster but not detected
+                        cluster_info = saver._redis.cluster("info")
+                        print(f"  - 🔍 Cluster info available despite non-cluster client: {cluster_info[:100]}...")
+                        print("  - ❌ ISSUE FOUND: This IS a cluster but not detected as such!")
+                        # Force cluster mode
+                        saver.cluster_mode = True
+                        print("  - 🔧 Forced cluster_mode = True")
+                    except Exception as e:
+                        print(f"  - No cluster info available: {e}")
+            except Exception as e:
+                print(f"  - Error checking cluster info: {e}")
+            
             # Step 5: Test basic operation
             print("Step 5: Testing basic operations...")
             thread_id = f"debug-test-{i}"
