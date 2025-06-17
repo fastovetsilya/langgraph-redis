@@ -16,8 +16,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.types import ChannelProtocol
-from redisvl.query import FilterQuery
-from redisvl.query.filter import Tag
+# Removed redisvl dependencies for basic Redis implementation
 
 from langgraph.checkpoint.redis.util import (
     safely_decode,
@@ -190,11 +189,9 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
                 pass
 
     def setup(self) -> None:
-        """Initialize the indices in Redis."""
-        # Create indexes in Redis
-        self.checkpoints_index.create(overwrite=False)
-        self.checkpoint_blobs_index.create(overwrite=False)
-        self.checkpoint_writes_index.create(overwrite=False)
+        """Initialize the Redis connection."""
+        # No longer creates search indexes - basic Redis implementation
+        pass
 
     def _load_checkpoint(
         self,
@@ -410,27 +407,34 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
             return blob.encode() if isinstance(blob, str) else blob
 
     def _load_writes_from_redis(self, write_key: str) -> List[Tuple[str, str, Any]]:
-        """Load writes from Redis JSON storage by key."""
+        """Load writes from Redis hash storage by key."""
         if not write_key:
             return []
 
-        # Get the full JSON document
-        result = self._redis.json().get(write_key)
+        # Get the hash data
+        result = self._redis.hgetall(write_key)
         if not result:
             return []
 
-        writes = []
-        for write in result["writes"]:
-            writes.append(
+        # Decode hash data
+        decoded_data = {}
+        for k, v in result.items():
+            key_str = k.decode() if isinstance(k, bytes) else k
+            val = v.decode() if isinstance(v, bytes) and key_str != "blob" else v
+            decoded_data[key_str] = val
+
+        # Return single write as tuple
+        if all(key in decoded_data for key in ["task_id", "channel", "type", "blob"]):
+            return [
                 (
-                    write["task_id"],
-                    write["channel"],
+                    decoded_data["task_id"],
+                    decoded_data["channel"],
                     self.serde.loads_typed(
-                        (write["type"], self._decode_blob(write["blob"]))
+                        (decoded_data["type"], decoded_data["blob"])
                     ),
                 )
-            )
-        return writes
+            ]
+        return []
 
     def put_writes(
         self,
@@ -439,7 +443,7 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
         task_id: str,
         task_path: str = "",
     ) -> None:
-        """Store intermediate writes linked to a checkpoint.
+        """Store intermediate writes linked to a checkpoint using basic Redis operations.
 
         Args:
             config: Configuration of the related checkpoint.
@@ -457,7 +461,7 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
             type_, blob = self.serde.dumps_typed(value)
             write_obj = {
                 "thread_id": to_storage_safe_id(thread_id),
-                "checkpoint_ns": checkpoint_ns,  # Don't use sentinel for tag fields in RediSearch
+                "checkpoint_ns": to_storage_safe_str(checkpoint_ns),
                 "checkpoint_id": to_storage_safe_id(checkpoint_id),
                 "task_id": task_id,
                 "task_path": task_path,
@@ -468,10 +472,37 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
             }
             writes_objects.append(write_obj)
 
-        # For each write, check existence and then perform appropriate operation
-        with self._redis.json().pipeline(transaction=False) as pipeline:
-            # Keep track of keys we're creating
-            created_keys = []
+        # Check if cluster mode is enabled
+        cluster_mode = getattr(self, "cluster_mode", False)
+        created_keys = []
+
+        if cluster_mode:
+            # For cluster mode, handle writes individually
+            for write_obj in writes_objects:
+                key = self._make_redis_checkpoint_writes_key(
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint_id,
+                    task_id,
+                    write_obj["idx"],
+                )
+
+                # Check if key exists
+                key_exists = self._redis.exists(key) == 1
+
+                if all(w[0] in WRITES_IDX_MAP for w in writes):
+                    # UPSERT case - store as hash
+                    self._redis.hset(key, mapping=write_obj)
+                    if not key_exists:
+                        created_keys.append(key)
+                else:
+                    # INSERT case - only insert if doesn't exist
+                    if not key_exists:
+                        self._redis.hset(key, mapping=write_obj)
+                        created_keys.append(key)
+        else:
+            # For non-cluster mode, use pipeline for efficiency
+            pipeline = self._redis.pipeline()
 
             for write_obj in writes_objects:
                 key = self._make_redis_checkpoint_writes_key(
@@ -482,75 +513,35 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
                     write_obj["idx"],
                 )
 
-                # First check if key exists
+                # Check if key exists
                 key_exists = self._redis.exists(key) == 1
 
                 if all(w[0] in WRITES_IDX_MAP for w in writes):
-                    # UPSERT case - only update specific fields
-                    if key_exists:
-                        # Update only channel, type, and blob fields
-                        pipeline.set(key, "$.channel", write_obj["channel"])
-                        pipeline.set(key, "$.type", write_obj["type"])
-                        pipeline.set(key, "$.blob", write_obj["blob"])
-                    else:
-                        # For new records, set the complete object
-                        pipeline.set(key, "$", write_obj)
+                    # UPSERT case - store as hash
+                    pipeline.hset(key, mapping=write_obj)
+                    if not key_exists:
                         created_keys.append(key)
                 else:
                     # INSERT case - only insert if doesn't exist
                     if not key_exists:
-                        pipeline.set(key, "$", write_obj)
+                        pipeline.hset(key, mapping=write_obj)
                         created_keys.append(key)
 
             pipeline.execute()
 
-            # Apply TTL to newly created keys
-            if created_keys and self.ttl_config and "default_ttl" in self.ttl_config:
-                self._apply_ttl_to_keys(
-                    created_keys[0], created_keys[1:] if len(created_keys) > 1 else None
-                )
+        # Apply TTL to newly created keys
+        if created_keys and self.ttl_config and "default_ttl" in self.ttl_config:
+            self._apply_ttl_to_keys(
+                created_keys[0], created_keys[1:] if len(created_keys) > 1 else None
+            )
 
     def _load_pending_writes(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: str
     ) -> List[PendingWrite]:
-        if checkpoint_id is None:
-            return []  # Early return if no checkpoint_id
-
-        # Use search index instead of keys() to avoid CrossSlot errors
-        # Note: For checkpoint_ns, we use the raw value for tag searches
-        # because RediSearch may not handle sentinel values correctly in tag fields
-        writes_query = FilterQuery(
-            filter_expression=(Tag("thread_id") == to_storage_safe_id(thread_id))
-            & (Tag("checkpoint_ns") == checkpoint_ns)
-            & (Tag("checkpoint_id") == to_storage_safe_id(checkpoint_id)),
-            return_fields=["task_id", "idx", "channel", "type", "$.blob"],
-            num_results=1000,  # Adjust as needed
-        )
-
-        writes_results = self.checkpoint_writes_index.search(writes_query)
-
-        # Sort results by idx to maintain order
-        sorted_writes = sorted(writes_results.docs, key=lambda x: getattr(x, "idx", 0))
-
-        # Build the writes dictionary
-        writes_dict: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for doc in sorted_writes:
-            task_id = str(getattr(doc, "task_id", ""))
-            idx = str(getattr(doc, "idx", 0))
-            blob_data = getattr(doc, "$.blob", "")
-            # Ensure blob is bytes for deserialization
-            if isinstance(blob_data, str):
-                blob_data = blob_data.encode("utf-8")
-            writes_dict[(task_id, idx)] = {
-                "task_id": task_id,
-                "idx": idx,
-                "channel": str(getattr(doc, "channel", "")),
-                "type": str(getattr(doc, "type", "")),
-                "blob": blob_data,
-            }
-
-        pending_writes = BaseRedisSaver._load_writes(self.serde, writes_dict)
-        return pending_writes
+        """Load pending writes - implemented in subclasses for specific Redis operations."""
+        # This is now implemented in the concrete RedisSaver class
+        # using basic Redis operations instead of search indexes
+        return []
 
     @staticmethod
     def _load_writes(

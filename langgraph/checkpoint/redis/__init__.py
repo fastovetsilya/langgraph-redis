@@ -16,10 +16,6 @@ from langgraph.checkpoint.base import (
 from langgraph.constants import TASKS
 from redis import Redis
 from redis.cluster import RedisCluster
-from redisvl.index import SearchIndex
-from redisvl.query import FilterQuery
-from redisvl.query.filter import Num, Tag
-from redisvl.redis.connection import RedisConnectionFactory
 
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.checkpoint.redis.ashallow import AsyncShallowRedisSaver
@@ -37,8 +33,8 @@ from langgraph.checkpoint.redis.version import __lib_name__, __version__
 logger = logging.getLogger(__name__)
 
 
-class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
-    """Standard Redis implementation for checkpoint saving."""
+class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
+    """Redis implementation for checkpoint saving without RediSearch."""
 
     _redis: Union[Redis, RedisCluster]  # Support both standalone and cluster clients
     # Whether to assume the Redis server is a cluster; None triggers auto-detection
@@ -67,25 +63,33 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
     ) -> None:
         """Configure the Redis client."""
         self._owns_its_client = redis_client is None
-        self._redis = redis_client or RedisConnectionFactory.get_redis_connection(
-            redis_url, **connection_args
-        )
+        
+        if redis_client:
+            self._redis = redis_client
+        else:
+            # Create Redis client without redisvl dependency
+            connection_args = connection_args or {}
+            if redis_url:
+                # Parse URL and create appropriate client
+                if 'cluster' in redis_url.lower() or connection_args.get('cluster_mode'):
+                    self._redis = RedisCluster.from_url(redis_url, **connection_args)
+                else:
+                    self._redis = Redis.from_url(redis_url, **connection_args)
+            else:
+                # Default connection
+                if connection_args.get('cluster_mode'):
+                    self._redis = RedisCluster(**connection_args)
+                else:
+                    self._redis = Redis(**connection_args)
 
     def create_indexes(self) -> None:
-        self.checkpoints_index = SearchIndex.from_dict(
-            self.SCHEMAS[0], redis_client=self._redis
-        )
-        self.checkpoint_blobs_index = SearchIndex.from_dict(
-            self.SCHEMAS[1], redis_client=self._redis
-        )
-        self.checkpoint_writes_index = SearchIndex.from_dict(
-            self.SCHEMAS[2], redis_client=self._redis
-        )
+        """No-op since we don't use search indexes."""
+        pass
 
     def setup(self) -> None:
-        """Initialize the indices in Redis and detect cluster mode."""
+        """Initialize the Redis connection and detect cluster mode."""
         self._detect_cluster_mode()
-        super().setup()
+        # No need to create search indexes
 
     def _detect_cluster_mode(self) -> None:
         """Detect if the Redis client is a cluster client by inspecting its class."""
@@ -111,126 +115,148 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         before: Optional[RunnableConfig] = None,
         limit: Optional[int] = None,
     ) -> Iterator[CheckpointTuple]:
-        """List checkpoints from Redis."""
-        # Construct the filter expression
-        filter_expression = []
+        """List checkpoints from Redis using basic key operations."""
+        # Build search pattern
+        thread_id = None
+        checkpoint_ns = ""
+        checkpoint_id = None
+        
         if config:
-            filter_expression.append(
-                Tag("thread_id")
-                == to_storage_safe_id(config["configurable"]["thread_id"])
-            )
+            thread_id = config["configurable"]["thread_id"]
+            checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+            checkpoint_id = get_checkpoint_id(config)
 
-            # Reproducing the logic from the Postgres implementation, we'll
-            # search for checkpoints with any namespace, including an empty
-            # string, while `checkpoint_id` has to have a value.
-            if checkpoint_ns := config["configurable"].get("checkpoint_ns"):
-                filter_expression.append(
-                    Tag("checkpoint_ns") == to_storage_safe_str(checkpoint_ns)
+        # Create key pattern
+        if thread_id:
+            pattern_parts = [
+                "checkpoint",
+                to_storage_safe_id(thread_id),
+                to_storage_safe_str(checkpoint_ns),
+                "*" if not checkpoint_id else to_storage_safe_id(checkpoint_id)
+            ]
+            pattern = ":".join(pattern_parts)
+        else:
+            pattern = "checkpoint:*"
+
+        # Use SCAN to find matching keys
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+            keys.extend(batch_keys)
+            if cursor == 0:
+                break
+        
+        # Limit keys if specified
+        if limit:
+            keys = keys[:limit]
+
+        # Process each key
+        for key_bytes in keys:
+            key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+            
+            try:
+                # Parse key to get thread_id, checkpoint_ns, checkpoint_id
+                parts = key.split(":")
+                if len(parts) < 4 or parts[0] != "checkpoint":
+                    continue
+                    
+                key_thread_id = from_storage_safe_id(parts[1])
+                key_checkpoint_ns = from_storage_safe_str(parts[2])
+                key_checkpoint_id = from_storage_safe_id(parts[3])
+                
+                # Apply additional filters
+                if filter:
+                    checkpoint_data = self._redis.hgetall(key)
+                    if not checkpoint_data:
+                        continue
+                        
+                    # Check filter conditions
+                    if "source" in filter:
+                        if checkpoint_data.get(b"source", b"").decode() != filter["source"]:
+                            continue
+                    if "step" in filter:
+                        try:
+                            step_value = int(checkpoint_data.get(b"step", b"0"))
+                            if step_value != filter["step"]:
+                                continue
+                        except (ValueError, TypeError):
+                            continue
+
+                # Get checkpoint data
+                checkpoint_data = self._redis.hgetall(key)
+                if not checkpoint_data:
+                    continue
+
+                # Decode bytes keys/values
+                decoded_data = {}
+                for k, v in checkpoint_data.items():
+                    key_str = k.decode() if isinstance(k, bytes) else k
+                    val_str = v.decode() if isinstance(v, bytes) else v
+                    decoded_data[key_str] = val_str
+
+                # Get channel values
+                channel_values = self.get_channel_values(
+                    thread_id=key_thread_id,
+                    checkpoint_ns=key_checkpoint_ns,
+                    checkpoint_id=key_checkpoint_id,
                 )
-            if checkpoint_id := get_checkpoint_id(config):
-                filter_expression.append(
-                    Tag("checkpoint_id") == to_storage_safe_id(checkpoint_id)
-                )
 
-        if filter:
-            for k, v in filter.items():
-                if k == "source":
-                    filter_expression.append(Tag("source") == v)
-                elif k == "step":
-                    filter_expression.append(Num("step") == v)
-                else:
-                    raise ValueError(f"Unsupported filter key: {k}")
+                # Get pending sends from parent checkpoint
+                pending_sends = []
+                parent_checkpoint_id = decoded_data.get("parent_checkpoint_id")
+                if parent_checkpoint_id and parent_checkpoint_id != EMPTY_ID_SENTINEL:
+                    pending_sends = self._load_pending_sends(
+                        thread_id=key_thread_id,
+                        checkpoint_ns=key_checkpoint_ns,
+                        parent_checkpoint_id=from_storage_safe_id(parent_checkpoint_id),
+                    )
 
-        # if before:
-        #     filter_expression.append(Tag("checkpoint_id") < get_checkpoint_id(before))
+                # Parse metadata
+                metadata_str = decoded_data.get("metadata", "{}")
+                try:
+                    metadata_dict = json.loads(metadata_str)
+                except (json.JSONDecodeError, TypeError):
+                    metadata_dict = {}
 
-        # Combine all filter expressions
-        combined_filter = filter_expression[0] if filter_expression else "*"
-        for expr in filter_expression[1:]:
-            combined_filter &= expr
-
-        # Construct the Redis query
-        query = FilterQuery(
-            filter_expression=combined_filter,
-            return_fields=[
-                "thread_id",
-                "checkpoint_ns",
-                "checkpoint_id",
-                "parent_checkpoint_id",
-                "$.checkpoint",
-                "$.metadata",
-            ],
-            num_results=limit or 10000,
-        )
-
-        # Execute the query
-        results = self.checkpoints_index.search(query)
-
-        # Process the results
-        for doc in results.docs:
-            thread_id = from_storage_safe_id(doc["thread_id"])
-            checkpoint_ns = from_storage_safe_str(doc["checkpoint_ns"])
-            checkpoint_id = from_storage_safe_id(doc["checkpoint_id"])
-            parent_checkpoint_id = from_storage_safe_id(doc["parent_checkpoint_id"])
-
-            # Fetch channel_values
-            channel_values = self.get_channel_values(
-                thread_id=thread_id,
-                checkpoint_ns=checkpoint_ns,
-                checkpoint_id=checkpoint_id,
-            )
-
-            # Fetch pending_sends from parent checkpoint
-            pending_sends = []
-            if parent_checkpoint_id:
-                pending_sends = self._load_pending_sends(
-                    thread_id=thread_id,
-                    checkpoint_ns=checkpoint_ns,
-                    parent_checkpoint_id=parent_checkpoint_id,
-                )
-
-            # Fetch and parse metadata
-            raw_metadata = getattr(doc, "$.metadata", "{}")
-            metadata_dict = (
-                json.loads(raw_metadata)
-                if isinstance(raw_metadata, str)
-                else raw_metadata
-            )
-
-            # Ensure metadata matches CheckpointMetadata type
-            sanitized_metadata = {
-                k.replace("\u0000", ""): (
-                    v.replace("\u0000", "") if isinstance(v, str) else v
-                )
-                for k, v in metadata_dict.items()
-            }
-            metadata = cast(CheckpointMetadata, sanitized_metadata)
-
-            config_param: RunnableConfig = {
-                "configurable": {
-                    "thread_id": thread_id,
-                    "checkpoint_ns": checkpoint_ns,
-                    "checkpoint_id": checkpoint_id,
+                # Sanitize metadata
+                sanitized_metadata = {
+                    k.replace("\u0000", ""): (
+                        v.replace("\u0000", "") if isinstance(v, str) else v
+                    )
+                    for k, v in metadata_dict.items()
                 }
-            }
+                metadata = cast(CheckpointMetadata, sanitized_metadata)
 
-            checkpoint_param = self._load_checkpoint(
-                doc["$.checkpoint"],
-                channel_values,
-                pending_sends,
-            )
+                config_param: RunnableConfig = {
+                    "configurable": {
+                        "thread_id": key_thread_id,
+                        "checkpoint_ns": key_checkpoint_ns,
+                        "checkpoint_id": key_checkpoint_id,
+                    }
+                }
 
-            pending_writes = self._load_pending_writes(
-                thread_id, checkpoint_ns, checkpoint_id
-            )
+                checkpoint_param = self._load_checkpoint(
+                    decoded_data.get("checkpoint", "{}"),
+                    channel_values,
+                    pending_sends,
+                )
 
-            yield CheckpointTuple(
-                config=config_param,
-                checkpoint=checkpoint_param,
-                metadata=metadata,
-                parent_config=None,
-                pending_writes=pending_writes,
-            )
+                pending_writes = self._load_pending_writes(
+                    key_thread_id, key_checkpoint_ns, key_checkpoint_id
+                )
+
+                yield CheckpointTuple(
+                    config=config_param,
+                    checkpoint=checkpoint_param,
+                    metadata=metadata,
+                    parent_config=None,
+                    pending_writes=pending_writes,
+                )
+                
+            except Exception as e:
+                logger.warning(f"Error processing checkpoint key {key}: {e}")
+                continue
 
     def put(
         self,
@@ -239,11 +265,11 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
-        """Store a checkpoint to Redis."""
+        """Store a checkpoint to Redis using hash operations."""
         configurable = config["configurable"].copy()
 
         thread_id = configurable.pop("thread_id")
-        checkpoint_ns = configurable.pop("checkpoint_ns")
+        checkpoint_ns = configurable.pop("checkpoint_ns", "")
         thread_ts = configurable.pop("thread_ts", "")
         checkpoint_id = (
             configurable.pop("checkpoint_id", configurable.pop("thread_ts", ""))
@@ -267,21 +293,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
             }
         }
 
-        # Store checkpoint data.
-        checkpoint_data = {
-            "thread_id": storage_safe_thread_id,
-            "checkpoint_ns": storage_safe_checkpoint_ns,
-            "checkpoint_id": storage_safe_checkpoint_id,
-            "parent_checkpoint_id": storage_safe_checkpoint_id,
-            "checkpoint": self._dump_checkpoint(copy),
-            "metadata": self._dump_metadata(metadata),
-        }
-
-        # store at top-level for filters in list()
-        if all(key in metadata for key in ["source", "step"]):
-            checkpoint_data["source"] = metadata["source"]
-            checkpoint_data["step"] = metadata["step"]  # type: ignore
-
         # Create the checkpoint key
         checkpoint_key = BaseRedisSaver._make_redis_checkpoint_key(
             storage_safe_thread_id,
@@ -289,12 +300,25 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
             storage_safe_checkpoint_id,
         )
 
-        self.checkpoints_index.load(
-            [checkpoint_data],
-            keys=[checkpoint_key],
-        )
+        # Store checkpoint data as hash
+        checkpoint_data = {
+            "thread_id": storage_safe_thread_id,
+            "checkpoint_ns": storage_safe_checkpoint_ns,
+            "checkpoint_id": storage_safe_checkpoint_id,
+            "parent_checkpoint_id": storage_safe_checkpoint_id,
+            "checkpoint": json.dumps(self._dump_checkpoint(copy)),
+            "metadata": self._dump_metadata(metadata),
+        }
 
-        # Store blob values.
+        # Add filter fields if they exist in metadata
+        if all(key in metadata for key in ["source", "step"]):
+            checkpoint_data["source"] = metadata["source"]
+            checkpoint_data["step"] = str(metadata["step"])
+
+        # Store as Redis hash
+        self._redis.hset(checkpoint_key, mapping=checkpoint_data)
+
+        # Store blob values
         blobs = self._dump_blobs(
             storage_safe_thread_id,
             storage_safe_checkpoint_ns,
@@ -303,11 +327,10 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         )
 
         blob_keys = []
-        if blobs:
-            # Unzip the list of tuples into separate lists for keys and data
-            keys, data = zip(*blobs)
-            blob_keys = list(keys)
-            self.checkpoint_blobs_index.load(list(data), keys=blob_keys)
+        for blob_key, blob_data in blobs:
+            # Store blob as hash
+            self._redis.hset(blob_key, mapping=blob_data)
+            blob_keys.append(blob_key)
 
         # Apply TTL to checkpoint and blob keys if configured
         if self.ttl_config and "default_ttl" in self.ttl_config:
@@ -316,113 +339,85 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         return next_config
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
-        """Get a checkpoint tuple from Redis.
-
-        Args:
-            config (RunnableConfig): The config to use for retrieving the checkpoint.
-
-        Returns:
-            Optional[CheckpointTuple]: The retrieved checkpoint tuple, or None if no matching checkpoint was found.
-        """
+        """Get a checkpoint tuple from Redis using basic operations."""
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
 
-        ascending = True
-
         if checkpoint_id and checkpoint_id != EMPTY_ID_SENTINEL:
-            checkpoint_filter_expression = (
-                (Tag("thread_id") == to_storage_safe_id(thread_id))
-                & (Tag("checkpoint_ns") == to_storage_safe_str(checkpoint_ns))
-                & (Tag("checkpoint_id") == to_storage_safe_id(checkpoint_id))
-            )
-        else:
-            checkpoint_filter_expression = (
-                Tag("thread_id") == to_storage_safe_id(thread_id)
-            ) & (Tag("checkpoint_ns") == to_storage_safe_str(checkpoint_ns))
-            ascending = False
-
-        # Construct the query
-        checkpoints_query = FilterQuery(
-            filter_expression=checkpoint_filter_expression,
-            return_fields=[
-                "thread_id",
-                "checkpoint_ns",
-                "checkpoint_id",
-                "parent_checkpoint_id",
-                "$.checkpoint",
-                "$.metadata",
-            ],
-            num_results=1,
-        )
-        checkpoints_query.sort_by("checkpoint_id", asc=ascending)
-
-        # Execute the query
-        results = self.checkpoints_index.search(checkpoints_query)
-        if not results.docs:
-            return None
-
-        doc = results.docs[0]
-        doc_thread_id = from_storage_safe_id(doc["thread_id"])
-        doc_checkpoint_ns = from_storage_safe_str(doc["checkpoint_ns"])
-        doc_checkpoint_id = from_storage_safe_id(doc["checkpoint_id"])
-        doc_parent_checkpoint_id = from_storage_safe_id(doc["parent_checkpoint_id"])
-
-        # If refresh_on_read is enabled, refresh TTL for checkpoint key and related keys
-        if self.ttl_config and self.ttl_config.get("refresh_on_read"):
-            # Get the checkpoint key
+            # Get specific checkpoint
             checkpoint_key = BaseRedisSaver._make_redis_checkpoint_key(
-                to_storage_safe_id(doc_thread_id),
-                to_storage_safe_str(doc_checkpoint_ns),
-                to_storage_safe_id(doc_checkpoint_id),
+                to_storage_safe_id(thread_id),
+                to_storage_safe_str(checkpoint_ns),
+                to_storage_safe_id(checkpoint_id),
             )
+            
+            checkpoint_data = self._redis.hgetall(checkpoint_key)
+            if not checkpoint_data:
+                return None
+                
+        else:
+            # Get latest checkpoint for thread
+            pattern = f"checkpoint:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:*"
+            
+            keys = []
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+                keys.extend(batch_keys)
+                if cursor == 0:
+                    break
+            
+            if not keys:
+                return None
+                
+            # Sort keys to get the latest (assuming checkpoint_id is sortable)
+            keys.sort(reverse=True)
+            checkpoint_key = keys[0].decode() if isinstance(keys[0], bytes) else keys[0]
+            
+            checkpoint_data = self._redis.hgetall(checkpoint_key)
+            if not checkpoint_data:
+                return None
 
-            # Get all blob keys related to this checkpoint
-            from langgraph.checkpoint.redis.base import (
-                CHECKPOINT_BLOB_PREFIX,
-                CHECKPOINT_WRITE_PREFIX,
-            )
+        # Decode checkpoint data
+        decoded_data = {}
+        for k, v in checkpoint_data.items():
+            key_str = k.decode() if isinstance(k, bytes) else k
+            val_str = v.decode() if isinstance(v, bytes) else v
+            decoded_data[key_str] = val_str
 
-            # Get the blob keys using search index instead of keys()
-            blob_query = FilterQuery(
-                filter_expression=(
-                    Tag("thread_id") == to_storage_safe_id(doc_thread_id)
-                )
-                & (Tag("checkpoint_ns") == to_storage_safe_str(doc_checkpoint_ns)),
-                return_fields=["key"],  # Assuming the key field exists in the index
-                num_results=1000,
-            )
-            blob_results = self.checkpoint_blobs_index.search(blob_query)
-            blob_keys = [
-                f"{CHECKPOINT_BLOB_PREFIX}:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:{getattr(doc, 'channel', '')}:{getattr(doc, 'version', '')}"
-                for doc in blob_results.docs
-            ]
+        doc_thread_id = from_storage_safe_id(decoded_data["thread_id"])
+        doc_checkpoint_ns = from_storage_safe_str(decoded_data["checkpoint_ns"])
+        doc_checkpoint_id = from_storage_safe_id(decoded_data["checkpoint_id"])
+        doc_parent_checkpoint_id = from_storage_safe_id(decoded_data.get("parent_checkpoint_id", ""))
 
-            # Get checkpoint write keys using search index
-            write_query = FilterQuery(
-                filter_expression=(
-                    Tag("thread_id") == to_storage_safe_id(doc_thread_id)
-                )
-                & (Tag("checkpoint_ns") == to_storage_safe_str(doc_checkpoint_ns))
-                & (Tag("checkpoint_id") == to_storage_safe_id(doc_checkpoint_id)),
-                return_fields=["task_id", "idx"],
-                num_results=1000,
-            )
-            write_results = self.checkpoint_writes_index.search(write_query)
-            write_keys = [
-                BaseRedisSaver._make_redis_checkpoint_writes_key(
-                    to_storage_safe_id(doc_thread_id),
-                    to_storage_safe_str(doc_checkpoint_ns),
-                    to_storage_safe_id(doc_checkpoint_id),
-                    getattr(doc, "task_id", ""),
-                    getattr(doc, "idx", 0),
-                )
-                for doc in write_results.docs
-            ]
+        # If refresh_on_read is enabled, refresh TTL
+        if self.ttl_config and self.ttl_config.get("refresh_on_read"):
+            # Get related blob and write keys
+            blob_pattern = f"checkpoint_blob:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:*"
+            write_pattern = f"checkpoint_write:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:{to_storage_safe_id(doc_checkpoint_id)}:*"
+            
+            all_keys = [checkpoint_key]
+            
+            # Get blob keys
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=blob_pattern, count=1000)
+                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
+                    
+            # Get write keys  
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=write_pattern, count=1000)
+                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
 
-            # Apply TTL to checkpoint, blob keys, and write keys
-            all_related_keys = blob_keys + write_keys
-            self._apply_ttl_to_keys(checkpoint_key, all_related_keys)
+            # Apply TTL to all related keys
+            if len(all_keys) > 1:
+                self._apply_ttl_to_keys(all_keys[0], all_keys[1:])
 
         # Fetch channel_values
         channel_values = self.get_channel_values(
@@ -440,13 +435,14 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
                 parent_checkpoint_id=doc_parent_checkpoint_id,
             )
 
-        # Fetch and parse metadata
-        raw_metadata = getattr(doc, "$.metadata", "{}")
-        metadata_dict = (
-            json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-        )
+        # Parse metadata
+        metadata_str = decoded_data.get("metadata", "{}")
+        try:
+            metadata_dict = json.loads(metadata_str)
+        except (json.JSONDecodeError, TypeError):
+            metadata_dict = {}
 
-        # Ensure metadata matches CheckpointMetadata type
+        # Sanitize metadata
         sanitized_metadata = {
             k.replace("\u0000", ""): (
                 v.replace("\u0000", "") if isinstance(v, str) else v
@@ -464,7 +460,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         }
 
         checkpoint_param = self._load_checkpoint(
-            doc["$.checkpoint"],
+            decoded_data.get("checkpoint", "{}"),
             channel_values,
             pending_sends,
         )
@@ -490,9 +486,9 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         redis_client: Optional[Union[Redis, RedisCluster]] = None,
         connection_args: Optional[Dict[str, Any]] = None,
         ttl: Optional[Dict[str, Any]] = None,
-    ) -> Iterator[RedisSaver]:
+    ) -> Iterator["RedisSaver"]:
         """Create a new RedisSaver instance."""
-        saver: Optional[RedisSaver] = None
+        saver: Optional["RedisSaver"] = None
         try:
             saver = cls(
                 redis_url=redis_url,
@@ -505,58 +501,60 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         finally:
             if saver and saver._owns_its_client:  # Ensure saver is not None
                 saver._redis.close()
-                saver._redis.connection_pool.disconnect()
+                if hasattr(saver._redis, 'connection_pool'):
+                    saver._redis.connection_pool.disconnect()
 
     def get_channel_values(
         self, thread_id: str, checkpoint_ns: str = "", checkpoint_id: str = ""
     ) -> Dict[str, Any]:
-        """Retrieve channel_values dictionary with properly constructed message objects."""
+        """Retrieve channel_values using basic Redis operations."""
         storage_safe_thread_id = to_storage_safe_id(thread_id)
         storage_safe_checkpoint_ns = to_storage_safe_str(checkpoint_ns)
         storage_safe_checkpoint_id = to_storage_safe_id(checkpoint_id)
 
-        checkpoint_query = FilterQuery(
-            filter_expression=(Tag("thread_id") == storage_safe_thread_id)
-            & (Tag("checkpoint_ns") == storage_safe_checkpoint_ns)
-            & (Tag("checkpoint_id") == storage_safe_checkpoint_id),
-            return_fields=["$.checkpoint.channel_versions"],
-            num_results=1,
+        # Get checkpoint to find channel_versions
+        checkpoint_key = BaseRedisSaver._make_redis_checkpoint_key(
+            storage_safe_thread_id,
+            storage_safe_checkpoint_ns,
+            storage_safe_checkpoint_id,
         )
 
-        checkpoint_result = self.checkpoints_index.search(checkpoint_query)
-        if not checkpoint_result.docs:
+        checkpoint_data = self._redis.hgetall(checkpoint_key)
+        if not checkpoint_data:
             return {}
 
-        channel_versions = json.loads(
-            getattr(checkpoint_result.docs[0], "$.checkpoint.channel_versions", "{}")
-        )
+        # Parse checkpoint data to get channel_versions
+        checkpoint_str = checkpoint_data.get(b"checkpoint", b"{}").decode()
+        try:
+            checkpoint_dict = json.loads(checkpoint_str)
+            channel_versions = checkpoint_dict.get("channel_versions", {})
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
         if not channel_versions:
             return {}
 
         channel_values = {}
         for channel, version in channel_versions.items():
-            blob_query = FilterQuery(
-                filter_expression=(Tag("thread_id") == storage_safe_thread_id)
-                & (Tag("checkpoint_ns") == storage_safe_checkpoint_ns)
-                & (Tag("channel") == channel)
-                & (Tag("version") == version),
-                return_fields=["type", "$.blob"],
-                num_results=1,
+            blob_key = BaseRedisSaver._make_redis_checkpoint_blob_key(
+                storage_safe_thread_id,
+                storage_safe_checkpoint_ns,
+                channel,
+                str(version),
             )
 
-            blob_results = self.checkpoint_blobs_index.search(blob_query)
-            if blob_results.docs:
-                blob_doc = blob_results.docs[0]
-                blob_type = getattr(blob_doc, "type", None)
-                blob_data = getattr(blob_doc, "$.blob", None)
+            blob_data = self._redis.hgetall(blob_key)
+            if blob_data:
+                blob_type = blob_data.get(b"type", b"").decode()
+                blob_content = blob_data.get(b"blob")
 
-                if blob_data and blob_type and blob_type != "empty":
-                    # Ensure blob_data is bytes for deserialization
-                    if isinstance(blob_data, str):
-                        blob_data = blob_data.encode("utf-8")
-                    channel_values[channel] = self.serde.loads_typed(
-                        (str(blob_type), blob_data)
-                    )
+                if blob_content and blob_type and blob_type != "empty":
+                    try:
+                        channel_values[channel] = self.serde.loads_typed(
+                            (blob_type, blob_content)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error loading blob for channel {channel}: {e}")
 
         return channel_values
 
@@ -566,124 +564,114 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], SearchIndex]):
         checkpoint_ns: str,
         parent_checkpoint_id: str,
     ) -> List[Tuple[str, bytes]]:
-        """Load pending sends for a parent checkpoint.
+        """Load pending sends for a parent checkpoint using basic Redis operations."""
+        # Find write keys for parent checkpoint with TASKS channel
+        pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(parent_checkpoint_id)}:*"
+        
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+            keys.extend(batch_keys)
+            if cursor == 0:
+                break
 
-        Args:
-            thread_id: The thread ID
-            checkpoint_ns: The checkpoint namespace
-            parent_checkpoint_id: The ID of the parent checkpoint
+        # Filter for TASKS channel and collect writes
+        writes = []
+        for key_bytes in keys:
+            key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+            write_data = self._redis.hgetall(key)
+            
+            if write_data:
+                channel = write_data.get(b"channel", b"").decode()
+                if channel == TASKS:
+                    write_type = write_data.get(b"type", b"").decode()
+                    write_blob = write_data.get(b"blob", b"")
+                    task_path = write_data.get(b"task_path", b"").decode()
+                    task_id = write_data.get(b"task_id", b"").decode()
+                    idx = int(write_data.get(b"idx", b"0"))
+                    
+                    writes.append((task_path, task_id, idx, write_type, write_blob))
 
-        Returns:
-            List of (type, blob) tuples representing pending sends
-        """
-        storage_safe_thread_id = to_storage_safe_str(thread_id)
-        storage_safe_checkpoint_ns = to_storage_safe_str(checkpoint_ns)
-        storage_safe_parent_checkpoint_id = to_storage_safe_str(parent_checkpoint_id)
+        # Sort by task_path, task_id, idx
+        writes.sort(key=lambda x: (x[0], x[1], x[2]))
 
-        # Query checkpoint_writes for parent checkpoint's TASKS channel
-        parent_writes_query = FilterQuery(
-            filter_expression=(Tag("thread_id") == storage_safe_thread_id)
-            & (Tag("checkpoint_ns") == storage_safe_checkpoint_ns)
-            & (Tag("checkpoint_id") == storage_safe_parent_checkpoint_id)
-            & (Tag("channel") == TASKS),
-            return_fields=["type", "blob", "task_path", "task_id", "idx"],
-            num_results=100,  # Adjust as needed
-        )
-        parent_writes_results = self.checkpoint_writes_index.search(parent_writes_query)
+        # Return type and blob pairs
+        return [(write[3], write[4]) for write in writes]
 
-        # Sort results by task_path, task_id, idx (matching Postgres implementation)
-        sorted_writes = sorted(
-            parent_writes_results.docs,
-            key=lambda x: (
-                getattr(x, "task_path", ""),
-                getattr(x, "task_id", ""),
-                getattr(x, "idx", 0),
-            ),
-        )
+    def _load_pending_writes(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: str
+    ) -> List[Any]:
+        """Load pending writes using basic Redis operations."""
+        if checkpoint_id is None:
+            return []
 
-        # Extract type and blob pairs
-        return [(doc.type, doc.blob) for doc in sorted_writes]
+        # Find write keys for this checkpoint
+        pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(checkpoint_id)}:*"
+        
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+            keys.extend(batch_keys)
+            if cursor == 0:
+                break
+
+        # Collect writes data
+        writes_dict = {}
+        for key_bytes in keys:
+            key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
+            write_data = self._redis.hgetall(key)
+            
+            if write_data:
+                task_id = write_data.get(b"task_id", b"").decode()
+                idx = write_data.get(b"idx", b"0").decode()
+                channel = write_data.get(b"channel", b"").decode()
+                write_type = write_data.get(b"type", b"").decode()
+                write_blob = write_data.get(b"blob", b"")
+                
+                writes_dict[(task_id, idx)] = {
+                    "task_id": task_id,
+                    "idx": idx,
+                    "channel": channel,
+                    "type": write_type,
+                    "blob": write_blob,
+                }
+
+        return BaseRedisSaver._load_writes(self.serde, writes_dict)
 
     def delete_thread(self, thread_id: str) -> None:
-        """Delete all checkpoints and writes associated with a specific thread ID.
-
-        Args:
-            thread_id: The thread ID whose checkpoints should be deleted.
-        """
+        """Delete all checkpoints and writes associated with a specific thread ID."""
         storage_safe_thread_id = to_storage_safe_id(thread_id)
 
-        # Delete all checkpoints for this thread
-        checkpoint_query = FilterQuery(
-            filter_expression=Tag("thread_id") == storage_safe_thread_id,
-            return_fields=["checkpoint_ns", "checkpoint_id"],
-            num_results=10000,  # Get all checkpoints for this thread
-        )
-
-        checkpoint_results = self.checkpoints_index.search(checkpoint_query)
-
         # Collect all keys to delete
+        patterns = [
+            f"checkpoint:{storage_safe_thread_id}:*",
+            f"checkpoint_blob:{storage_safe_thread_id}:*", 
+            f"checkpoint_write:{storage_safe_thread_id}:*"
+        ]
+        
         keys_to_delete = []
+        for pattern in patterns:
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+                keys_to_delete.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
 
-        for doc in checkpoint_results.docs:
-            checkpoint_ns = getattr(doc, "checkpoint_ns", "")
-            checkpoint_id = getattr(doc, "checkpoint_id", "")
-
-            # Delete checkpoint key
-            checkpoint_key = BaseRedisSaver._make_redis_checkpoint_key(
-                storage_safe_thread_id, checkpoint_ns, checkpoint_id
-            )
-            keys_to_delete.append(checkpoint_key)
-
-        # Delete all blobs for this thread
-        blob_query = FilterQuery(
-            filter_expression=Tag("thread_id") == storage_safe_thread_id,
-            return_fields=["checkpoint_ns", "channel", "version"],
-            num_results=10000,
-        )
-
-        blob_results = self.checkpoint_blobs_index.search(blob_query)
-
-        for doc in blob_results.docs:
-            checkpoint_ns = getattr(doc, "checkpoint_ns", "")
-            channel = getattr(doc, "channel", "")
-            version = getattr(doc, "version", "")
-
-            blob_key = BaseRedisSaver._make_redis_checkpoint_blob_key(
-                storage_safe_thread_id, checkpoint_ns, channel, version
-            )
-            keys_to_delete.append(blob_key)
-
-        # Delete all writes for this thread
-        writes_query = FilterQuery(
-            filter_expression=Tag("thread_id") == storage_safe_thread_id,
-            return_fields=["checkpoint_ns", "checkpoint_id", "task_id", "idx"],
-            num_results=10000,
-        )
-
-        writes_results = self.checkpoint_writes_index.search(writes_query)
-
-        for doc in writes_results.docs:
-            checkpoint_ns = getattr(doc, "checkpoint_ns", "")
-            checkpoint_id = getattr(doc, "checkpoint_id", "")
-            task_id = getattr(doc, "task_id", "")
-            idx = getattr(doc, "idx", 0)
-
-            write_key = BaseRedisSaver._make_redis_checkpoint_writes_key(
-                storage_safe_thread_id, checkpoint_ns, checkpoint_id, task_id, idx
-            )
-            keys_to_delete.append(write_key)
-
-        # Execute all deletions based on cluster mode
-        if self.cluster_mode:
-            # For cluster mode, delete keys individually
-            for key in keys_to_delete:
-                self._redis.delete(key)
-        else:
-            # For non-cluster mode, use pipeline for efficiency
-            pipeline = self._redis.pipeline()
-            for key in keys_to_delete:
-                pipeline.delete(key)
-            pipeline.execute()
+        # Execute deletions based on cluster mode
+        if keys_to_delete:
+            if self.cluster_mode:
+                # For cluster mode, delete keys individually
+                for key in keys_to_delete:
+                    self._redis.delete(key)
+            else:
+                # For non-cluster mode, use pipeline for efficiency
+                pipeline = self._redis.pipeline()
+                for key in keys_to_delete:
+                    pipeline.delete(key)
+                pipeline.execute()
 
 
 __all__ = [
