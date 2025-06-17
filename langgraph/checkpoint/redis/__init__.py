@@ -39,6 +39,8 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
     _redis: Union[Redis, RedisCluster]  # Support both standalone and cluster clients
     # Whether to assume the Redis server is a cluster; None triggers auto-detection
     cluster_mode: Optional[bool] = None
+    # Store the original startup_nodes for cluster mode scanning fallback
+    _startup_nodes: List[dict[str, Any]] = []
 
     def __init__(
         self,
@@ -63,6 +65,8 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
     ) -> None:
         """Configure the Redis client."""
         self._owns_its_client = redis_client is None
+        # Reset startup nodes list on each configuration
+        self._startup_nodes = []
         
         if redis_client:
             self._redis = redis_client
@@ -72,6 +76,9 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             
             # Remove cluster_mode from connection_args as it's not a Redis connection parameter
             cluster_mode_hint = connection_args.pop('cluster_mode', None)
+            
+            # Extract password for later standalone node scans (if provided)
+            standalone_password = connection_args.get('password')
             
             if redis_url:
                 # Parse URL and create appropriate client
@@ -84,10 +91,18 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                         formatted_nodes = []
                         for node in startup_nodes:
                             if isinstance(node, dict) and 'host' in node and 'port' in node:
+                                # Keep dict version for fallback scans
+                                self._startup_nodes.append({'host': node['host'], 'port': node['port'], 'password': standalone_password})
                                 formatted_nodes.append(ClusterNode(node['host'], node['port']))
                             else:
                                 formatted_nodes.append(node)
                         connection_args['startup_nodes'] = formatted_nodes
+                    elif startup_nodes:
+                        # startup_nodes already ClusterNode instances – preserve for fallback
+                        from redis.cluster import ClusterNode
+                        for sn in startup_nodes:
+                            if isinstance(sn, ClusterNode):
+                                self._startup_nodes.append({'host': sn.host, 'port': sn.port, 'password': standalone_password})
                     
                     self._redis = RedisCluster.from_url(redis_url, **connection_args)
                 else:
@@ -99,19 +114,10 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     if 'startup_nodes' not in connection_args:
                         connection_args['startup_nodes'] = [{'host': 'localhost', 'port': 6379}]
                     
-                    # Ensure startup_nodes are in the correct format for redis-py
-                    startup_nodes = connection_args.get('startup_nodes', [])
-                    if startup_nodes and isinstance(startup_nodes[0], dict):
-                        # Convert dict format to the format expected by redis-py cluster
-                        formatted_nodes = []
-                        for node in startup_nodes:
-                            if isinstance(node, dict) and 'host' in node and 'port' in node:
-                                # Use the ClusterNode format that redis-py expects
-                                from redis.cluster import ClusterNode
-                                formatted_nodes.append(ClusterNode(node['host'], node['port']))
-                            else:
-                                formatted_nodes.append(node)
-                        connection_args['startup_nodes'] = formatted_nodes
+                    # Preserve for fallback scans
+                    for node in connection_args['startup_nodes']:
+                        if isinstance(node, dict):
+                            self._startup_nodes.append({'host': node['host'], 'port': node['port'], 'password': standalone_password})
                     
                     self._redis = RedisCluster(**connection_args)
                 else:
@@ -760,7 +766,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             return keys
         else:
             # For cluster mode, use a simpler approach that works with redis-py cluster client
-            all_keys = []
+            all_keys: List[str] = []
             try:
                 # Method 1: Try using the cluster client's built-in scan_iter
                 if hasattr(self._redis, 'scan_iter'):
@@ -786,8 +792,29 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     all_keys = [k.decode() if isinstance(k, bytes) else k for k in keys]
                     return all_keys
                 except Exception as e2:
-                    logger.error(f"Failed to scan keys in cluster mode: {e2}")
-                    return []
+                    logger.warning(f"KEYS fallback failed: {e2}. Trying per-startup-node scan")
+
+                    # Final fallback: iterate over original startup nodes with standalone connections
+                    aggregated: list[str] = []
+                    for node in getattr(self, "_startup_nodes", []):
+                        try:
+                            host = node.get("host")
+                            port = node.get("port")
+                            pwd = node.get("password")
+                            if not host or not port:
+                                continue
+                            standalone_client = Redis(host=host, port=port, password=pwd, socket_timeout=2)
+                            cursor_inner = 0
+                            while True:
+                                cursor_inner, bkeys = standalone_client.scan(cursor_inner, match=pattern, count=count)
+                                aggregated.extend([k.decode() if isinstance(k, bytes) else k for k in bkeys])
+                                if cursor_inner == 0:
+                                    break
+                            standalone_client.close()
+                        except Exception as node_exc:
+                            logger.debug(f"Node scan error on {node}: {node_exc}")
+                            continue
+                    return aggregated
 
 
 __all__ = [
