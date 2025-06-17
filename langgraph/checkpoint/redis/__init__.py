@@ -246,6 +246,36 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         # Determine cluster mode based on client class
         if isinstance(self._redis, RedisCluster):
             logger.info("Redis client is a cluster client")
+            
+            # Validate that the cluster client is properly initialized
+            try:
+                # Test if cluster client is properly initialized by checking for default node
+                if hasattr(self._redis, 'get_default_node'):
+                    default_node = self._redis.get_default_node()
+                    if default_node is None:
+                        logger.warning("Cluster client exists but get_default_node() returned None. Treating as standalone Redis.")
+                        self.cluster_mode = False
+                        return
+                    elif not hasattr(default_node, 'redis_connection'):
+                        logger.warning("Cluster default node exists but has no redis_connection. Treating as standalone Redis.")
+                        self.cluster_mode = False
+                        return
+                
+                # Additional validation: try a simple ping to ensure cluster is accessible
+                try:
+                    self._redis.ping()
+                    logger.info("Cluster ping successful, confirmed cluster mode")
+                    self.cluster_mode = True
+                except Exception as e:
+                    logger.warning(f"Cluster ping failed: {e}. Treating as standalone Redis.")
+                    self.cluster_mode = False
+                    return
+                        
+            except Exception as e:
+                logger.warning(f"Cluster validation failed: {e}. Treating as standalone Redis.")
+                self.cluster_mode = False
+                return
+                
             self.cluster_mode = True
         else:
             logger.info("Redis client is a standalone client")
@@ -478,6 +508,31 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             except Exception:
                 # If cluster info fails, we're likely on standalone Redis
                 pass
+        
+        # Validate cluster client is properly initialized before using cluster operations
+        if actual_cluster_mode:
+            try:
+                # Test if cluster client is properly initialized by checking for default node
+                if hasattr(self._redis, 'get_default_node'):
+                    default_node = self._redis.get_default_node()
+                    if default_node is None:
+                        logger.warning("Cluster client exists but get_default_node() returned None. Falling back to non-cluster mode.")
+                        actual_cluster_mode = False
+                    elif not hasattr(default_node, 'redis_connection'):
+                        logger.warning("Cluster default node exists but has no redis_connection. Falling back to non-cluster mode.")
+                        actual_cluster_mode = False
+                
+                # Additional validation: try a simple ping to ensure cluster is accessible
+                if actual_cluster_mode:
+                    try:
+                        self._redis.ping()
+                    except Exception as e:
+                        logger.warning(f"Cluster ping failed: {e}. Falling back to non-cluster mode.")
+                        actual_cluster_mode = False
+                        
+            except Exception as e:
+                logger.warning(f"Cluster validation failed: {e}. Falling back to non-cluster mode.")
+                actual_cluster_mode = False
         
         if actual_cluster_mode:
             # For cluster mode, handle operations individually
@@ -841,7 +896,21 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # Execute deletions based on cluster mode
         if keys_to_delete:
-            if self.cluster_mode:
+            # Validate cluster mode before using cluster operations
+            use_cluster_mode = self.cluster_mode
+            if use_cluster_mode:
+                try:
+                    # Validate cluster client is working before using individual operations
+                    if hasattr(self._redis, 'get_default_node'):
+                        default_node = self._redis.get_default_node()
+                        if default_node is None or not hasattr(default_node, 'redis_connection'):
+                            logger.warning("Cluster validation failed in delete_thread. Using pipeline mode.")
+                            use_cluster_mode = False
+                except Exception as e:
+                    logger.warning(f"Cluster validation failed in delete_thread: {e}. Using pipeline mode.")
+                    use_cluster_mode = False
+            
+            if use_cluster_mode:
                 # For cluster mode, delete keys individually
                 for key in keys_to_delete:
                     self._redis.delete(key)
@@ -876,7 +945,21 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         if ttl_minutes is not None:
             ttl_seconds = int(ttl_minutes * 60)
 
-            if self.cluster_mode:
+            # Validate cluster mode before using cluster operations
+            use_cluster_mode = self.cluster_mode
+            if use_cluster_mode:
+                try:
+                    # Validate cluster client is working before using individual operations
+                    if hasattr(self._redis, 'get_default_node'):
+                        default_node = self._redis.get_default_node()
+                        if default_node is None or not hasattr(default_node, 'redis_connection'):
+                            logger.warning("Cluster validation failed in _apply_ttl_to_keys. Using pipeline mode.")
+                            use_cluster_mode = False
+                except Exception as e:
+                    logger.warning(f"Cluster validation failed in _apply_ttl_to_keys: {e}. Using pipeline mode.")
+                    use_cluster_mode = False
+
+            if use_cluster_mode:
                 # For cluster mode, execute TTL operations individually
                 self._redis.expire(main_key, ttl_seconds)
 
