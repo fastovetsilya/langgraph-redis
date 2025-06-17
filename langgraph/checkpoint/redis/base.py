@@ -467,8 +467,8 @@ class BaseRedisSaver(BaseCheckpointSaver[str], Generic[RedisClientType, IndexTyp
                 "task_path": task_path,
                 "idx": WRITES_IDX_MAP.get(channel, idx),
                 "channel": channel,
-                "type": type_,
-                "blob": blob,
+                "type": type_ or "",
+                "blob": blob if blob is not None else b"",
             }
             writes_objects.append(write_obj)
 

@@ -312,11 +312,19 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # Add filter fields if they exist in metadata
         if all(key in metadata for key in ["source", "step"]):
-            checkpoint_data["source"] = metadata["source"]
-            checkpoint_data["step"] = str(metadata["step"])
+            checkpoint_data["source"] = str(metadata["source"]) if metadata["source"] is not None else ""
+            checkpoint_data["step"] = str(metadata["step"]) if metadata["step"] is not None else "0"
+
+        # Clean checkpoint_data to ensure no None values
+        cleaned_checkpoint_data = {}
+        for k, v in checkpoint_data.items():
+            if v is not None:
+                cleaned_checkpoint_data[k] = v
+            else:
+                cleaned_checkpoint_data[k] = ""
 
         # Store as Redis hash
-        self._redis.hset(checkpoint_key, mapping=checkpoint_data)
+        self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
 
         # Store blob values
         blobs = self._dump_blobs(
@@ -328,8 +336,17 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         blob_keys = []
         for blob_key, blob_data in blobs:
+            # Clean blob_data to ensure no None values
+            cleaned_blob_data = {}
+            for k, v in blob_data.items():
+                if v is not None:
+                    cleaned_blob_data[k] = v
+                else:
+                    # Convert None to empty string for Redis compatibility
+                    cleaned_blob_data[k] = ""
+            
             # Store blob as hash
-            self._redis.hset(blob_key, mapping=blob_data)
+            self._redis.hset(blob_key, mapping=cleaned_blob_data)
             blob_keys.append(blob_key)
 
         # Apply TTL to checkpoint and blob keys if configured
