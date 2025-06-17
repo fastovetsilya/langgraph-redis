@@ -69,15 +69,22 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         else:
             # Create Redis client without redisvl dependency
             connection_args = connection_args or {}
+            
+            # Remove cluster_mode from connection_args as it's not a Redis connection parameter
+            cluster_mode_hint = connection_args.pop('cluster_mode', None)
+            
             if redis_url:
                 # Parse URL and create appropriate client
-                if 'cluster' in redis_url.lower() or connection_args.get('cluster_mode'):
+                if 'cluster' in redis_url.lower() or cluster_mode_hint:
                     self._redis = RedisCluster.from_url(redis_url, **connection_args)
                 else:
                     self._redis = Redis.from_url(redis_url, **connection_args)
             else:
                 # Default connection
-                if connection_args.get('cluster_mode'):
+                if cluster_mode_hint:
+                    # For cluster mode, we need startup_nodes
+                    if 'startup_nodes' not in connection_args:
+                        connection_args['startup_nodes'] = [{'host': 'localhost', 'port': 6379}]
                     self._redis = RedisCluster(**connection_args)
                 else:
                     self._redis = Redis(**connection_args)
@@ -138,14 +145,10 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         else:
             pattern = "checkpoint:*"
 
-        # Use SCAN to find matching keys
-        keys = []
-        cursor = 0
-        while True:
-            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-            keys.extend(batch_keys)
-            if cursor == 0:
-                break
+        # Use cluster-safe key scanning
+        keys = self._scan_keys_cluster_safe(pattern, count=1000)
+        # Convert to bytes for consistency with original code
+        keys = [k.encode() if isinstance(k, str) else k for k in keys]
         
         # Limit keys if specified
         if limit:
@@ -374,16 +377,12 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 return None
                 
         else:
-            # Get latest checkpoint for thread
+            # Get latest checkpoint for thread using cluster-safe scanning
             pattern = f"checkpoint:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:*"
             
-            keys = []
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-                keys.extend(batch_keys)
-                if cursor == 0:
-                    break
+            keys = self._scan_keys_cluster_safe(pattern, count=1000)
+            # Convert to bytes for consistency
+            keys = [k.encode() if isinstance(k, str) else k for k in keys]
             
             if not keys:
                 return None
@@ -410,27 +409,19 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # If refresh_on_read is enabled, refresh TTL
         if self.ttl_config and self.ttl_config.get("refresh_on_read"):
-            # Get related blob and write keys
+            # Get related blob and write keys using cluster-safe scanning
             blob_pattern = f"checkpoint_blob:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:*"
             write_pattern = f"checkpoint_write:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:{to_storage_safe_id(doc_checkpoint_id)}:*"
             
             all_keys = [checkpoint_key]
             
-            # Get blob keys
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=blob_pattern, count=1000)
-                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
+            # Get blob keys using cluster-safe scanning
+            blob_keys = self._scan_keys_cluster_safe(blob_pattern, count=1000)
+            all_keys.extend(blob_keys)
                     
-            # Get write keys  
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=write_pattern, count=1000)
-                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
+            # Get write keys using cluster-safe scanning
+            write_keys = self._scan_keys_cluster_safe(write_pattern, count=1000)
+            all_keys.extend(write_keys)
 
             # Apply TTL to all related keys
             if len(all_keys) > 1:
@@ -582,16 +573,12 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         parent_checkpoint_id: str,
     ) -> List[Tuple[str, bytes]]:
         """Load pending sends for a parent checkpoint using basic Redis operations."""
-        # Find write keys for parent checkpoint with TASKS channel
+        # Find write keys for parent checkpoint with TASKS channel using cluster-safe scanning
         pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(parent_checkpoint_id)}:*"
         
-        keys = []
-        cursor = 0
-        while True:
-            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-            keys.extend(batch_keys)
-            if cursor == 0:
-                break
+        keys = self._scan_keys_cluster_safe(pattern, count=1000)
+        # Convert to bytes for consistency
+        keys = [k.encode() if isinstance(k, str) else k for k in keys]
 
         # Filter for TASKS channel and collect writes
         writes = []
@@ -623,16 +610,12 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         if checkpoint_id is None:
             return []
 
-        # Find write keys for this checkpoint
+        # Find write keys for this checkpoint using cluster-safe scanning
         pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(checkpoint_id)}:*"
         
-        keys = []
-        cursor = 0
-        while True:
-            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-            keys.extend(batch_keys)
-            if cursor == 0:
-                break
+        keys = self._scan_keys_cluster_safe(pattern, count=1000)
+        # Convert to bytes for consistency
+        keys = [k.encode() if isinstance(k, str) else k for k in keys]
 
         # Collect writes data
         writes_dict = {}
@@ -661,7 +644,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         """Delete all checkpoints and writes associated with a specific thread ID."""
         storage_safe_thread_id = to_storage_safe_id(thread_id)
 
-        # Collect all keys to delete
+        # Collect all keys to delete using cluster-safe scanning
         patterns = [
             f"checkpoint:{storage_safe_thread_id}:*",
             f"checkpoint_blob:{storage_safe_thread_id}:*", 
@@ -670,12 +653,8 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         
         keys_to_delete = []
         for pattern in patterns:
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-                keys_to_delete.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
+            pattern_keys = self._scan_keys_cluster_safe(pattern, count=1000)
+            keys_to_delete.extend(pattern_keys)
 
         # Execute deletions based on cluster mode
         if keys_to_delete:
@@ -689,6 +668,104 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 for key in keys_to_delete:
                     pipeline.delete(key)
                 pipeline.execute()
+
+    def _apply_ttl_to_keys(
+        self,
+        main_key: str,
+        related_keys: Optional[List[str]] = None,
+        ttl_minutes: Optional[float] = None,
+    ) -> Any:
+        """Apply Redis native TTL to keys.
+
+        Args:
+            main_key: The primary Redis key
+            related_keys: Additional Redis keys that should expire at the same time
+            ttl_minutes: Time-to-live in minutes, overrides default_ttl if provided
+
+        Returns:
+            Result of the Redis operation
+        """
+        if ttl_minutes is None:
+            # Check if there's a default TTL in config
+            if self.ttl_config and "default_ttl" in self.ttl_config:
+                ttl_minutes = self.ttl_config.get("default_ttl")
+
+        if ttl_minutes is not None:
+            ttl_seconds = int(ttl_minutes * 60)
+
+            if self.cluster_mode:
+                # For cluster mode, execute TTL operations individually
+                self._redis.expire(main_key, ttl_seconds)
+
+                if related_keys:
+                    for key in related_keys:
+                        self._redis.expire(key, ttl_seconds)
+
+                return True
+            else:
+                # For non-cluster mode, use pipeline for efficiency
+                pipeline = self._redis.pipeline()
+
+                # Set TTL for main key
+                pipeline.expire(main_key, ttl_seconds)
+
+                # Set TTL for related keys
+                if related_keys:
+                    for key in related_keys:
+                        pipeline.expire(key, ttl_seconds)
+
+                return pipeline.execute()
+
+        return None
+
+    def _scan_keys_cluster_safe(self, pattern: str, count: int = 1000) -> List[str]:
+        """Scan for keys in a cluster-safe way."""
+        if not self.cluster_mode:
+            # Use regular SCAN for non-cluster mode
+            keys = []
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=count)
+                keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
+            return keys
+        else:
+            # For cluster mode, we need to scan each node individually
+            # This is more expensive but necessary for cluster compatibility
+            all_keys = []
+            try:
+                # Get cluster nodes and scan each one
+                nodes = self._redis.get_nodes()
+                for node in nodes:
+                    if node.is_replica:
+                        continue  # Skip replica nodes
+                    try:
+                        node_keys = []
+                        cursor = 0
+                        while True:
+                            cursor, batch_keys = node.redis_connection.scan(
+                                cursor, match=pattern, count=count
+                            )
+                            node_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                            if cursor == 0:
+                                break
+                        all_keys.extend(node_keys)
+                    except Exception as e:
+                        logger.warning(f"Error scanning node {node}: {e}")
+                        continue
+            except AttributeError:
+                # Fallback: try to use KEYS command (less efficient but works)
+                # Note: KEYS can be expensive on large datasets
+                logger.warning("Using KEYS command as fallback for cluster scanning")
+                try:
+                    keys = self._redis.keys(pattern)
+                    all_keys = [k.decode() if isinstance(k, bytes) else k for k in keys]
+                except Exception as e:
+                    logger.error(f"Failed to scan keys in cluster mode: {e}")
+                    return []
+            
+            return all_keys
 
 
 __all__ = [
