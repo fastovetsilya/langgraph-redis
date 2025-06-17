@@ -548,6 +548,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
+        _retry: bool = False,
     ) -> RunnableConfig:
         """Store a checkpoint to Redis using hash operations."""
         configurable = config["configurable"].copy()
@@ -708,8 +709,11 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     self.cluster_mode = True
                     try:
                         self._attempt_cluster_recovery()
-                        # Retry the put once with a healthy cluster client
-                        return self.put(config, checkpoint, metadata, new_versions)
+                        # Retry the put only if we have not retried before
+                        if not _retry:
+                            return self.put(
+                                config, checkpoint, metadata, new_versions, _retry=True
+                            )
                     except Exception as recovery_exc:
                         logger.error(
                             f"Cluster recovery failed after redirection error: {recovery_exc}"
@@ -758,8 +762,15 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                         self.cluster_mode = True
                         try:
                             self._attempt_cluster_recovery()
-                            # Retry the put once with a healthy cluster client
-                            return self.put(config, checkpoint, metadata, new_versions)
+                            # Retry the put only if we have not retried before
+                            if not _retry:
+                                return self.put(
+                                    config,
+                                    checkpoint,
+                                    metadata,
+                                    new_versions,
+                                    _retry=True,
+                                )
                         except Exception as recovery_exc:
                             logger.error(
                                 f"Cluster recovery failed after redirection error: {recovery_exc}"
