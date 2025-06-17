@@ -76,6 +76,19 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             if redis_url:
                 # Parse URL and create appropriate client
                 if 'cluster' in redis_url.lower() or cluster_mode_hint:
+                    # Ensure startup_nodes are in the correct format if provided
+                    startup_nodes = connection_args.get('startup_nodes', [])
+                    if startup_nodes and isinstance(startup_nodes[0], dict):
+                        # Convert dict format to ClusterNode format
+                        from redis.cluster import ClusterNode
+                        formatted_nodes = []
+                        for node in startup_nodes:
+                            if isinstance(node, dict) and 'host' in node and 'port' in node:
+                                formatted_nodes.append(ClusterNode(node['host'], node['port']))
+                            else:
+                                formatted_nodes.append(node)
+                        connection_args['startup_nodes'] = formatted_nodes
+                    
                     self._redis = RedisCluster.from_url(redis_url, **connection_args)
                 else:
                     self._redis = Redis.from_url(redis_url, **connection_args)
@@ -85,6 +98,21 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     # For cluster mode, we need startup_nodes
                     if 'startup_nodes' not in connection_args:
                         connection_args['startup_nodes'] = [{'host': 'localhost', 'port': 6379}]
+                    
+                    # Ensure startup_nodes are in the correct format for redis-py
+                    startup_nodes = connection_args.get('startup_nodes', [])
+                    if startup_nodes and isinstance(startup_nodes[0], dict):
+                        # Convert dict format to the format expected by redis-py cluster
+                        formatted_nodes = []
+                        for node in startup_nodes:
+                            if isinstance(node, dict) and 'host' in node and 'port' in node:
+                                # Use the ClusterNode format that redis-py expects
+                                from redis.cluster import ClusterNode
+                                formatted_nodes.append(ClusterNode(node['host'], node['port']))
+                            else:
+                                formatted_nodes.append(node)
+                        connection_args['startup_nodes'] = formatted_nodes
+                    
                     self._redis = RedisCluster(**connection_args)
                 else:
                     self._redis = Redis(**connection_args)
