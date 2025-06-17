@@ -77,12 +77,28 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             # Remove cluster_mode from connection_args as it's not a Redis connection parameter
             cluster_mode_hint = connection_args.pop('cluster_mode', None)
             
-            # Extract password for later standalone node scans (if provided)
+            # Extract password and SSL settings for later standalone node scans (if provided)
             standalone_password = connection_args.get('password')
+            # Extract SSL configuration for cluster fallback connections
+            ssl_config = {}
+            if 'ssl' in connection_args:
+                ssl_config['ssl'] = connection_args['ssl']
+            if 'ssl_cert_reqs' in connection_args:
+                ssl_config['ssl_cert_reqs'] = connection_args['ssl_cert_reqs']
+            if 'ssl_ca_certs' in connection_args:
+                ssl_config['ssl_ca_certs'] = connection_args['ssl_ca_certs']
+            if 'ssl_certfile' in connection_args:
+                ssl_config['ssl_certfile'] = connection_args['ssl_certfile']
+            if 'ssl_keyfile' in connection_args:
+                ssl_config['ssl_keyfile'] = connection_args['ssl_keyfile']
+            
+            # Check for SSL URL (rediss://) or cluster mode
+            is_ssl_url = redis_url and redis_url.startswith('rediss://')
+            is_cluster_mode = 'cluster' in (redis_url or '').lower() or cluster_mode_hint
             
             if redis_url:
                 # Parse URL and create appropriate client
-                if 'cluster' in redis_url.lower() or cluster_mode_hint:
+                if is_cluster_mode or is_ssl_url:
                     # Ensure startup_nodes are in the correct format if provided
                     startup_nodes = connection_args.get('startup_nodes', [])
                     if startup_nodes and isinstance(startup_nodes[0], dict):
@@ -91,8 +107,15 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                         formatted_nodes = []
                         for node in startup_nodes:
                             if isinstance(node, dict) and 'host' in node and 'port' in node:
-                                # Keep dict version for fallback scans
-                                self._startup_nodes.append({'host': node['host'], 'port': node['port'], 'password': standalone_password})
+                                # Keep dict version for fallback scans including SSL config
+                                node_config = {
+                                    'host': node['host'], 
+                                    'port': node['port'], 
+                                    'password': standalone_password
+                                }
+                                # Add SSL configuration to fallback node config
+                                node_config.update(ssl_config)
+                                self._startup_nodes.append(node_config)
                                 formatted_nodes.append(ClusterNode(node['host'], node['port']))
                             else:
                                 formatted_nodes.append(node)
@@ -102,10 +125,46 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                         from redis.cluster import ClusterNode
                         for sn in startup_nodes:
                             if isinstance(sn, ClusterNode):
-                                self._startup_nodes.append({'host': sn.host, 'port': sn.port, 'password': standalone_password})
+                                node_config = {
+                                    'host': sn.host, 
+                                    'port': sn.port, 
+                                    'password': standalone_password
+                                }
+                                # Add SSL configuration to fallback node config
+                                node_config.update(ssl_config)
+                                self._startup_nodes.append(node_config)
+                    elif is_ssl_url:
+                        # For SSL URLs without explicit startup_nodes, try to parse URL for host/port
+                        import urllib.parse
+                        try:
+                            parsed = urllib.parse.urlparse(redis_url)
+                            if parsed.hostname and parsed.port:
+                                node_config = {
+                                    'host': parsed.hostname,
+                                    'port': parsed.port,
+                                    'password': parsed.password or standalone_password
+                                }
+                                # For SSL URLs, ensure SSL is enabled in fallback config
+                                if is_ssl_url:
+                                    node_config['ssl'] = True
+                                    # Inherit SSL settings from connection_args
+                                    node_config.update(ssl_config)
+                                self._startup_nodes.append(node_config)
+                        except Exception as e:
+                            logger.warning(f"Failed to parse Redis URL for fallback nodes: {e}")
                     
                     try:
-                        self._redis = RedisCluster.from_url(redis_url, **connection_args)
+                        if is_cluster_mode:
+                            self._redis = RedisCluster.from_url(redis_url, **connection_args)
+                        else:
+                            # For SSL URLs that aren't explicitly cluster mode, try cluster first
+                            # then fallback to standalone
+                            try:
+                                # Try as cluster first for SSL URLs
+                                self._redis = RedisCluster.from_url(redis_url, **connection_args)
+                            except Exception:
+                                # Fallback to standalone SSL connection
+                                self._redis = Redis.from_url(redis_url, **connection_args)
                         # Test the connection
                         self._redis.ping()
                     except Exception as e:
@@ -127,7 +186,14 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     # Preserve for fallback scans
                     for node in connection_args['startup_nodes']:
                         if isinstance(node, dict):
-                            self._startup_nodes.append({'host': node['host'], 'port': node['port'], 'password': standalone_password})
+                            node_config = {
+                                'host': node['host'], 
+                                'port': node['port'], 
+                                'password': standalone_password
+                            }
+                            # Add SSL configuration to fallback node config
+                            node_config.update(ssl_config)
+                            self._startup_nodes.append(node_config)
                     
                     try:
                         self._redis = RedisCluster(**connection_args)
@@ -145,6 +211,10 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                             }
                             if first_node.get('password'):
                                 fallback_args['password'] = first_node['password']
+                            # Add SSL configuration to fallback args
+                            for ssl_key, ssl_value in ssl_config.items():
+                                if ssl_key in first_node:
+                                    fallback_args[ssl_key] = first_node[ssl_key]
                             self._redis = Redis(**fallback_args)
                             # Override cluster mode since we're using standalone
                             self.cluster_mode = False
@@ -882,7 +952,23 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                             pwd = node.get("password")
                             if not host or not port:
                                 continue
-                            standalone_client = Redis(host=host, port=port, password=pwd, socket_timeout=2)
+                            
+                            # Build connection args including SSL settings
+                            standalone_args = {
+                                'host': host,
+                                'port': port,
+                                'socket_timeout': 2
+                            }
+                            if pwd:
+                                standalone_args['password'] = pwd
+                            
+                            # Add SSL configuration if present in node config
+                            ssl_keys = ['ssl', 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile']
+                            for ssl_key in ssl_keys:
+                                if ssl_key in node:
+                                    standalone_args[ssl_key] = node[ssl_key]
+                            
+                            standalone_client = Redis(**standalone_args)
                             cursor_inner = 0
                             while True:
                                 cursor_inner, bkeys = standalone_client.scan(cursor_inner, match=pattern, count=count)
