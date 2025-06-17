@@ -119,12 +119,12 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         # Build search pattern
         thread_id = None
         checkpoint_ns = ""
-        checkpoint_id = None
         
         if config:
             thread_id = config["configurable"]["thread_id"]
             checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
-            checkpoint_id = get_checkpoint_id(config)
+            # Note: For list operations, we typically want all checkpoints for a thread,
+            # regardless of any checkpoint_id in the config
 
         # Create key pattern
         if thread_id:
@@ -132,7 +132,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 "checkpoint",
                 to_storage_safe_id(thread_id),
                 to_storage_safe_str(checkpoint_ns),
-                "*" if not checkpoint_id else to_storage_safe_id(checkpoint_id)
+                "*"  # Always use wildcard for listing all checkpoints in thread
             ]
             pattern = ":".join(pattern_parts)
         else:
