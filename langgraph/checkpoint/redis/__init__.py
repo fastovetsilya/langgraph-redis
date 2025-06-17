@@ -262,6 +262,81 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         """Attempt to recover from a broken cluster client by creating a standalone client."""
         logger.info("Attempting to recover from broken cluster client...")
         
+        # STEP 1 ──────────────────────────────────────────────────────────
+        # Try to rebuild a brand-new RedisCluster client first.  A MOVED/ASK
+        # error often means we accidentally downgraded to a standalone client
+        # that is now talking to a cluster node.  If we can successfully
+        # recreate a healthy cluster client, we prefer that over falling back
+        # to a standalone connection.
+
+        if hasattr(self, "_startup_nodes") and self._startup_nodes:
+            for node in self._startup_nodes:
+                try:
+                    host = node.get("host")
+                    port = node.get("port")
+                    if not host or not port:
+                        continue
+
+                    logger.info(
+                        f"Attempting to recreate RedisCluster client via {host}:{port}"
+                    )
+
+                    # Build minimal args for RedisCluster
+                    cluster_args: dict[str, Any] = {
+                        "startup_nodes": [{"host": host, "port": port}],
+                        "socket_timeout": 10,
+                        "socket_connect_timeout": 10,
+                    }
+
+                    # Common optional parameters
+                    if node.get("password"):
+                        cluster_args["password"] = node["password"]
+
+                    # Propagate SSL related keys if present
+                    ssl_keys = [
+                        "ssl",
+                        "ssl_cert_reqs",
+                        "ssl_ca_certs",
+                        "ssl_certfile",
+                        "ssl_keyfile",
+                    ]
+                    for ssl_key in ssl_keys:
+                        if ssl_key in node:
+                            cluster_args[ssl_key] = node[ssl_key]
+
+                    from redis.cluster import RedisCluster
+
+                    new_cluster_client = RedisCluster(**cluster_args)
+                    # Quick health-check
+                    new_cluster_client.ping()
+
+                    logger.info(
+                        f"Successfully recreated RedisCluster client via {host}:{port}"
+                    )
+
+                    # Close previous client if we created it internally
+                    if self._owns_its_client and hasattr(self._redis, "close"):
+                        try:
+                            self._redis.close()
+                        except Exception:
+                            pass
+
+                    self._redis = new_cluster_client
+                    self.cluster_mode = True
+                    logger.info("Recovered with refreshed RedisCluster client")
+                    return  # SUCCESS – no need to try standalone
+
+                except Exception as recreate_exc:
+                    logger.warning(
+                        f"Failed to recreate RedisCluster client for {node}: {recreate_exc}"
+                    )
+                    continue
+
+        # STEP 2 ──────────────────────────────────────────────────────────
+        # If we reach here, recreating a cluster client failed.  Fall back to
+        # the original behaviour of trying a direct standalone connection.
+        logger.info("Attempting to recover from broken cluster client...")
+        
         # Try to create a standalone client using the first startup node
         if hasattr(self, '_startup_nodes') and self._startup_nodes:
             for node in self._startup_nodes:
@@ -619,6 +694,28 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             except Exception as e:
                 logger.warning(f"Pipeline execution failed: {e}. Falling back to individual operations.")
                 
+                # Detect Redis cluster redirection errors (MOVED / ASK). These
+                # indicate that we're talking to a cluster node with a non-cluster
+                # client.  Attempt to rebuild a proper RedisCluster client and
+                # retry the write once.
+                err_msg = str(e)
+                if "MOVED" in err_msg or "ASK" in err_msg:
+                    logger.warning(
+                        f"Redis redirection error detected ({err_msg}). Initiating cluster recovery and retry."
+                    )
+
+                    # Force cluster mode so subsequent logic follows the cluster path
+                    self.cluster_mode = True
+                    try:
+                        self._attempt_cluster_recovery()
+                        # Retry the put once with a healthy cluster client
+                        return self.put(config, checkpoint, metadata, new_versions)
+                    except Exception as recovery_exc:
+                        logger.error(
+                            f"Cluster recovery failed after redirection error: {recovery_exc}"
+                        )
+                        raise recovery_exc
+
                 # Fallback to individual operations if pipeline fails
                 try:
                     # Store checkpoint data as hash
@@ -647,6 +744,28 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                         blob_keys.append(blob_key)
                         
                 except Exception as e2:
+                    # Detect Redis cluster redirection errors (MOVED / ASK). These
+                    # indicate that we're talking to a cluster node with a non-cluster
+                    # client.  Attempt to rebuild a proper RedisCluster client and
+                    # retry the write once.
+                    err_msg = str(e2)
+                    if "MOVED" in err_msg or "ASK" in err_msg:
+                        logger.warning(
+                            f"Redis redirection error detected ({err_msg}). Initiating cluster recovery and retry."
+                        )
+
+                        # Force cluster mode so subsequent logic follows the cluster path
+                        self.cluster_mode = True
+                        try:
+                            self._attempt_cluster_recovery()
+                            # Retry the put once with a healthy cluster client
+                            return self.put(config, checkpoint, metadata, new_versions)
+                        except Exception as recovery_exc:
+                            logger.error(
+                                f"Cluster recovery failed after redirection error: {recovery_exc}"
+                            )
+                            raise recovery_exc
+
                     logger.error(f"Both pipeline and individual operations failed: {e2}")
                     raise
 
