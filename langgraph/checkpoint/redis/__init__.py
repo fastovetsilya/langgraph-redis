@@ -393,31 +393,63 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             else:
                 cleaned_checkpoint_data[k] = ""
 
-        # Store as Redis hash
-        self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
-
-        # Store blob values
-        blobs = self._dump_blobs(
-            storage_safe_thread_id,
-            storage_safe_checkpoint_ns,
-            copy.get("channel_values", {}),
-            new_versions,
-        )
-
+        # Store checkpoint and blob data based on cluster mode
         blob_keys = []
-        for blob_key, blob_data in blobs:
-            # Clean blob_data to ensure no None values
-            cleaned_blob_data = {}
-            for k, v in blob_data.items():
-                if v is not None:
-                    cleaned_blob_data[k] = v
-                else:
-                    # Convert None to empty string for Redis compatibility
-                    cleaned_blob_data[k] = ""
+        if self.cluster_mode:
+            # For cluster mode, handle operations individually
+            self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
             
-            # Store blob as hash
-            self._redis.hset(blob_key, mapping=cleaned_blob_data)
-            blob_keys.append(blob_key)
+            # Store blob values individually
+            blobs = self._dump_blobs(
+                storage_safe_thread_id,
+                storage_safe_checkpoint_ns,
+                copy.get("channel_values", {}),
+                new_versions,
+            )
+
+            for blob_key, blob_data in blobs:
+                # Clean blob_data to ensure no None values
+                cleaned_blob_data = {}
+                for k, v in blob_data.items():
+                    if v is not None:
+                        cleaned_blob_data[k] = v
+                    else:
+                        # Convert None to empty string for Redis compatibility
+                        cleaned_blob_data[k] = ""
+                
+                # Store blob as hash
+                self._redis.hset(blob_key, mapping=cleaned_blob_data)
+                blob_keys.append(blob_key)
+        else:
+            # For non-cluster mode, use pipeline for efficiency
+            pipeline = self._redis.pipeline()
+            
+            # Store checkpoint data as hash
+            pipeline.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
+
+            # Store blob values
+            blobs = self._dump_blobs(
+                storage_safe_thread_id,
+                storage_safe_checkpoint_ns,
+                copy.get("channel_values", {}),
+                new_versions,
+            )
+
+            for blob_key, blob_data in blobs:
+                # Clean blob_data to ensure no None values
+                cleaned_blob_data = {}
+                for k, v in blob_data.items():
+                    if v is not None:
+                        cleaned_blob_data[k] = v
+                    else:
+                        # Convert None to empty string for Redis compatibility
+                        cleaned_blob_data[k] = ""
+                
+                # Store blob as hash
+                pipeline.hset(blob_key, mapping=cleaned_blob_data)
+                blob_keys.append(blob_key)
+            
+            pipeline.execute()
 
         # Apply TTL to checkpoint and blob keys if configured
         if self.ttl_config and "default_ttl" in self.ttl_config:
