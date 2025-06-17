@@ -395,7 +395,21 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # Store checkpoint and blob data based on cluster mode
         blob_keys = []
-        if self.cluster_mode:
+        
+        # Enhanced cluster mode detection - check if we're actually on a cluster
+        actual_cluster_mode = self.cluster_mode
+        if not actual_cluster_mode:
+            try:
+                # Try to execute cluster info command to detect if we're on a cluster
+                if hasattr(self._redis, 'cluster'):
+                    self._redis.cluster("info")
+                    actual_cluster_mode = True
+                    logger.info("Detected Redis cluster via cluster info command, using cluster mode")
+            except Exception:
+                # If cluster info fails, we're likely on standalone Redis
+                pass
+        
+        if actual_cluster_mode:
             # For cluster mode, handle operations individually
             self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
             

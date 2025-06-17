@@ -7,6 +7,35 @@ import logging
 from typing import Any, Dict
 from langgraph.checkpoint.redis import RedisSaver
 
+# MONKEY PATCH: Fix cluster mode detection and cross-slot handling
+def patched_put(self, config, checkpoint, metadata, new_versions):
+    """Patched put method that better handles cluster mode."""
+    # First, ensure cluster mode is correctly detected
+    if not hasattr(self, '_cluster_mode_checked'):
+        try:
+            # Try to get cluster info to confirm we're on a cluster
+            if hasattr(self._redis, 'cluster'):
+                cluster_info = self._redis.cluster("info")
+                print(f"🔧 PATCH: Detected Redis cluster, forcing cluster_mode=True")
+                self.cluster_mode = True
+            elif hasattr(self._redis, 'connection_pool') and hasattr(self._redis.connection_pool, 'nodes'):
+                print(f"🔧 PATCH: Detected cluster connection pool, forcing cluster_mode=True")
+                self.cluster_mode = True
+        except Exception as e:
+            # If we can't determine, but connection_args had cluster_mode=True, trust it
+            pass
+        
+        self._cluster_mode_checked = True
+    
+    # Call the original put method
+    return self._original_put(config, checkpoint, metadata, new_versions)
+
+# Apply the monkey patch
+if not hasattr(RedisSaver, '_original_put'):
+    RedisSaver._original_put = RedisSaver.put
+    RedisSaver.put = patched_put
+    print("🔧 Applied monkey patch to fix cluster mode detection")
+
 # Enable debug logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -114,6 +143,33 @@ def test_cluster_connection():
             print("Step 3: Running setup...")
             saver.setup()
             print(f"✅ Setup completed - cluster_mode: {getattr(saver, 'cluster_mode', 'Unknown')}")
+            
+            # Step 3a: Force cluster mode if we're actually connected to a cluster
+            print("Step 3a: Ensuring cluster mode is correctly set...")
+            try:
+                from redis.cluster import RedisCluster
+                # Try to get cluster info to confirm we're on a cluster
+                if hasattr(saver._redis, 'cluster'):
+                    cluster_info = saver._redis.cluster("info")
+                    print("  - ✅ Cluster info available - this IS a Redis cluster")
+                    if not getattr(saver, 'cluster_mode', False):
+                        print("  - 🔧 FIXING: cluster_mode was False but should be True")
+                        saver.cluster_mode = True
+                    else:
+                        print("  - ✅ cluster_mode is already correctly set to True")
+                elif isinstance(saver._redis, RedisCluster):
+                    print("  - ✅ Client is RedisCluster type")
+                    if not getattr(saver, 'cluster_mode', False):
+                        print("  - 🔧 FIXING: cluster_mode was False but should be True")
+                        saver.cluster_mode = True
+                else:
+                    print("  - ⚠️ Cannot determine if this is a cluster")
+            except Exception as e:
+                print(f"  - Error checking cluster status: {e}")
+                # As a safety measure, if we're connecting with cluster_mode=True in args, force it
+                if config.get("connection_args", {}).get("cluster_mode"):
+                    print("  - 🔧 FORCING cluster_mode=True based on connection_args")
+                    saver.cluster_mode = True
             
             # Step 4: Test ping
             print("Step 4: Testing ping...")
