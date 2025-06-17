@@ -245,38 +245,15 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # Determine cluster mode based on client class
         if isinstance(self._redis, RedisCluster):
-            logger.info("Redis client is a cluster client")
-            
-            # Validate that the cluster client is properly initialized
-            try:
-                # Test if cluster client is properly initialized by checking for default node
-                if hasattr(self._redis, 'get_default_node'):
-                    default_node = self._redis.get_default_node()
-                    if default_node is None:
-                        logger.warning("Cluster client exists but get_default_node() returned None. Attempting to recover with standalone client.")
-                        self._attempt_cluster_recovery()
-                        return
-                    elif not hasattr(default_node, 'redis_connection'):
-                        logger.warning("Cluster default node exists but has no redis_connection. Attempting to recover with standalone client.")
-                        self._attempt_cluster_recovery()
-                        return
-                
-                # Additional validation: try a simple ping to ensure cluster is accessible
-                try:
-                    self._redis.ping()
-                    logger.info("Cluster ping successful, confirmed cluster mode")
-                    self.cluster_mode = True
-                except Exception as e:
-                    logger.warning(f"Cluster ping failed: {e}. Attempting to recover with standalone client.")
-                    self._attempt_cluster_recovery()
-                    return
-                        
-            except Exception as e:
-                logger.warning(f"Cluster validation failed: {e}. Attempting to recover with standalone client.")
+            logger.info("Redis client is a cluster client candidate, validating...")
+            if self._is_cluster_healthy():
+                logger.info("Cluster client is healthy, enabling cluster_mode")
+                self.cluster_mode = True
+                return
+            else:
+                logger.warning("Cluster client validation failed, attempting recovery with standalone client")
                 self._attempt_cluster_recovery()
                 return
-                
-            self.cluster_mode = True
         else:
             logger.info("Redis client is a standalone client")
             self.cluster_mode = False
@@ -559,42 +536,17 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         blob_keys = []
         
         # Enhanced cluster mode detection - check if we're actually on a cluster
-        actual_cluster_mode = self.cluster_mode
+        actual_cluster_mode = self.cluster_mode and self._is_cluster_healthy()
         if not actual_cluster_mode:
+            # Optionally try to detect cluster if not already enabled
             try:
-                # Try to execute cluster info command to detect if we're on a cluster
                 if hasattr(self._redis, 'cluster'):
-                    self._redis.cluster("info")
-                    actual_cluster_mode = True
-                    logger.info("Detected Redis cluster via cluster info command, using cluster mode")
+                    self._redis.cluster('info')
+                    if self._is_cluster_healthy():
+                        actual_cluster_mode = True
+                        logger.info("Detected healthy Redis cluster via cluster info command, enabling cluster mode")
             except Exception:
-                # If cluster info fails, we're likely on standalone Redis
                 pass
-        
-        # Validate cluster client is properly initialized before using cluster operations
-        if actual_cluster_mode:
-            try:
-                # Test if cluster client is properly initialized by checking for default node
-                if hasattr(self._redis, 'get_default_node'):
-                    default_node = self._redis.get_default_node()
-                    if default_node is None:
-                        logger.warning("Cluster client exists but get_default_node() returned None. Falling back to non-cluster mode.")
-                        actual_cluster_mode = False
-                    elif not hasattr(default_node, 'redis_connection'):
-                        logger.warning("Cluster default node exists but has no redis_connection. Falling back to non-cluster mode.")
-                        actual_cluster_mode = False
-                
-                # Additional validation: try a simple ping to ensure cluster is accessible
-                if actual_cluster_mode:
-                    try:
-                        self._redis.ping()
-                    except Exception as e:
-                        logger.warning(f"Cluster ping failed: {e}. Falling back to non-cluster mode.")
-                        actual_cluster_mode = False
-                        
-            except Exception as e:
-                logger.warning(f"Cluster validation failed: {e}. Falling back to non-cluster mode.")
-                actual_cluster_mode = False
         
         if actual_cluster_mode:
             # For cluster mode, handle operations individually
@@ -1185,6 +1137,23 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                             logger.debug(f"Node scan error on {node}: {node_exc}")
                             continue
                     return aggregated
+
+    def _is_cluster_healthy(self) -> bool:
+        """Check if the current RedisCluster client appears usable."""
+        if not isinstance(self._redis, RedisCluster):
+            return False
+        try:
+            if hasattr(self._redis, 'get_default_node'):
+                node = self._redis.get_default_node()
+                if node is None:
+                    return False
+                if getattr(node, 'redis_connection', None) is None:
+                    return False
+            # simple ping
+            self._redis.ping()
+            return True
+        except Exception:
+            return False
 
 
 __all__ = [
