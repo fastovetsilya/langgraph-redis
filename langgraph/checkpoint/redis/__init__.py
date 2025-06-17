@@ -104,7 +104,17 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                             if isinstance(sn, ClusterNode):
                                 self._startup_nodes.append({'host': sn.host, 'port': sn.port, 'password': standalone_password})
                     
-                    self._redis = RedisCluster.from_url(redis_url, **connection_args)
+                    try:
+                        self._redis = RedisCluster.from_url(redis_url, **connection_args)
+                        # Test the connection
+                        self._redis.ping()
+                    except Exception as e:
+                        logger.warning(f"Failed to create cluster client from URL: {e}")
+                        # Fallback to standalone client if cluster fails
+                        logger.info("Falling back to standalone Redis client")
+                        self._redis = Redis.from_url(redis_url, **{k: v for k, v in connection_args.items() if k != 'startup_nodes'})
+                        # Override cluster mode since we're using standalone
+                        self.cluster_mode = False
                 else:
                     self._redis = Redis.from_url(redis_url, **connection_args)
             else:
@@ -119,7 +129,30 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                         if isinstance(node, dict):
                             self._startup_nodes.append({'host': node['host'], 'port': node['port'], 'password': standalone_password})
                     
-                    self._redis = RedisCluster(**connection_args)
+                    try:
+                        self._redis = RedisCluster(**connection_args)
+                        # Test the connection
+                        self._redis.ping()
+                    except Exception as e:
+                        logger.warning(f"Failed to create cluster client: {e}")
+                        # Fallback to standalone client using first startup node
+                        if self._startup_nodes:
+                            first_node = self._startup_nodes[0]
+                            logger.info(f"Falling back to standalone Redis client at {first_node['host']}:{first_node['port']}")
+                            fallback_args = {
+                                'host': first_node['host'],
+                                'port': first_node['port'],
+                            }
+                            if first_node.get('password'):
+                                fallback_args['password'] = first_node['password']
+                            self._redis = Redis(**fallback_args)
+                            # Override cluster mode since we're using standalone
+                            self.cluster_mode = False
+                        else:
+                            logger.info("Falling back to default standalone Redis client")
+                            self._redis = Redis(**{k: v for k, v in connection_args.items() if k != 'startup_nodes'})
+                            # Override cluster mode since we're using standalone
+                            self.cluster_mode = False
                 else:
                     self._redis = Redis(**connection_args)
 
