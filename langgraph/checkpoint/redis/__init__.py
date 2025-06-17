@@ -253,12 +253,12 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 if hasattr(self._redis, 'get_default_node'):
                     default_node = self._redis.get_default_node()
                     if default_node is None:
-                        logger.warning("Cluster client exists but get_default_node() returned None. Treating as standalone Redis.")
-                        self.cluster_mode = False
+                        logger.warning("Cluster client exists but get_default_node() returned None. Attempting to recover with standalone client.")
+                        self._attempt_cluster_recovery()
                         return
                     elif not hasattr(default_node, 'redis_connection'):
-                        logger.warning("Cluster default node exists but has no redis_connection. Treating as standalone Redis.")
-                        self.cluster_mode = False
+                        logger.warning("Cluster default node exists but has no redis_connection. Attempting to recover with standalone client.")
+                        self._attempt_cluster_recovery()
                         return
                 
                 # Additional validation: try a simple ping to ensure cluster is accessible
@@ -267,19 +267,81 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     logger.info("Cluster ping successful, confirmed cluster mode")
                     self.cluster_mode = True
                 except Exception as e:
-                    logger.warning(f"Cluster ping failed: {e}. Treating as standalone Redis.")
-                    self.cluster_mode = False
+                    logger.warning(f"Cluster ping failed: {e}. Attempting to recover with standalone client.")
+                    self._attempt_cluster_recovery()
                     return
                         
             except Exception as e:
-                logger.warning(f"Cluster validation failed: {e}. Treating as standalone Redis.")
-                self.cluster_mode = False
+                logger.warning(f"Cluster validation failed: {e}. Attempting to recover with standalone client.")
+                self._attempt_cluster_recovery()
                 return
                 
             self.cluster_mode = True
         else:
             logger.info("Redis client is a standalone client")
             self.cluster_mode = False
+
+    def _attempt_cluster_recovery(self) -> None:
+        """Attempt to recover from a broken cluster client by creating a standalone client."""
+        logger.info("Attempting to recover from broken cluster client...")
+        
+        # Try to create a standalone client using the first startup node
+        if hasattr(self, '_startup_nodes') and self._startup_nodes:
+            for node in self._startup_nodes:
+                try:
+                    host = node.get('host')
+                    port = node.get('port')
+                    if not host or not port:
+                        continue
+                        
+                    logger.info(f"Attempting to create standalone client for {host}:{port}")
+                    
+                    # Build connection args for standalone client
+                    standalone_args = {
+                        'host': host,
+                        'port': port,
+                        'socket_timeout': 10,
+                        'socket_connect_timeout': 10,
+                    }
+                    
+                    # Add credentials if available
+                    if node.get('password'):
+                        standalone_args['password'] = node['password']
+                    
+                    # Add SSL configuration if present
+                    ssl_keys = ['ssl', 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile']
+                    for ssl_key in ssl_keys:
+                        if ssl_key in node:
+                            standalone_args[ssl_key] = node[ssl_key]
+                    
+                    # Create standalone client
+                    standalone_client = Redis(**standalone_args)
+                    
+                    # Test the connection
+                    standalone_client.ping()
+                    
+                    # If we get here, the standalone client works
+                    logger.info(f"Successfully created standalone client for {host}:{port}")
+                    
+                    # Replace the broken cluster client
+                    if self._owns_its_client and hasattr(self._redis, 'close'):
+                        try:
+                            self._redis.close()
+                        except:
+                            pass
+                    
+                    self._redis = standalone_client
+                    self.cluster_mode = False
+                    logger.info("Successfully recovered with standalone Redis client")
+                    return
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to create standalone client for {node}: {e}")
+                    continue
+        
+        # If we can't recover, at least set cluster_mode to False
+        logger.warning("Could not recover with standalone client. Treating as broken cluster client.")
+        self.cluster_mode = False
 
     def list(
         self,
@@ -561,34 +623,69 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 blob_keys.append(blob_key)
         else:
             # For non-cluster mode, use pipeline for efficiency
-            pipeline = self._redis.pipeline()
-            
-            # Store checkpoint data as hash
-            pipeline.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
-
-            # Store blob values
-            blobs = self._dump_blobs(
-                storage_safe_thread_id,
-                storage_safe_checkpoint_ns,
-                copy.get("channel_values", {}),
-                new_versions,
-            )
-
-            for blob_key, blob_data in blobs:
-                # Clean blob_data to ensure no None values
-                cleaned_blob_data = {}
-                for k, v in blob_data.items():
-                    if v is not None:
-                        cleaned_blob_data[k] = v
-                    else:
-                        # Convert None to empty string for Redis compatibility
-                        cleaned_blob_data[k] = ""
+            try:
+                pipeline = self._redis.pipeline()
                 
-                # Store blob as hash
-                pipeline.hset(blob_key, mapping=cleaned_blob_data)
-                blob_keys.append(blob_key)
-            
-            pipeline.execute()
+                # Store checkpoint data as hash
+                pipeline.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
+
+                # Store blob values
+                blobs = self._dump_blobs(
+                    storage_safe_thread_id,
+                    storage_safe_checkpoint_ns,
+                    copy.get("channel_values", {}),
+                    new_versions,
+                )
+
+                for blob_key, blob_data in blobs:
+                    # Clean blob_data to ensure no None values
+                    cleaned_blob_data = {}
+                    for k, v in blob_data.items():
+                        if v is not None:
+                            cleaned_blob_data[k] = v
+                        else:
+                            # Convert None to empty string for Redis compatibility
+                            cleaned_blob_data[k] = ""
+                    
+                    # Store blob as hash
+                    pipeline.hset(blob_key, mapping=cleaned_blob_data)
+                    blob_keys.append(blob_key)
+                
+                pipeline.execute()
+                
+            except Exception as e:
+                logger.warning(f"Pipeline execution failed: {e}. Falling back to individual operations.")
+                
+                # Fallback to individual operations if pipeline fails
+                try:
+                    # Store checkpoint data as hash
+                    self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
+
+                    # Store blob values individually
+                    blobs = self._dump_blobs(
+                        storage_safe_thread_id,
+                        storage_safe_checkpoint_ns,
+                        copy.get("channel_values", {}),
+                        new_versions,
+                    )
+
+                    for blob_key, blob_data in blobs:
+                        # Clean blob_data to ensure no None values
+                        cleaned_blob_data = {}
+                        for k, v in blob_data.items():
+                            if v is not None:
+                                cleaned_blob_data[k] = v
+                            else:
+                                # Convert None to empty string for Redis compatibility
+                                cleaned_blob_data[k] = ""
+                        
+                        # Store blob as hash
+                        self._redis.hset(blob_key, mapping=cleaned_blob_data)
+                        blob_keys.append(blob_key)
+                        
+                except Exception as e2:
+                    logger.error(f"Both pipeline and individual operations failed: {e2}")
+                    raise
 
         # Apply TTL to checkpoint and blob keys if configured
         if self.ttl_config and "default_ttl" in self.ttl_config:
@@ -916,10 +1013,19 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     self._redis.delete(key)
             else:
                 # For non-cluster mode, use pipeline for efficiency
-                pipeline = self._redis.pipeline()
-                for key in keys_to_delete:
-                    pipeline.delete(key)
-                pipeline.execute()
+                try:
+                    pipeline = self._redis.pipeline()
+                    for key in keys_to_delete:
+                        pipeline.delete(key)
+                    pipeline.execute()
+                except Exception as e:
+                    logger.warning(f"Pipeline deletion failed: {e}. Falling back to individual deletions.")
+                    # Fallback to individual deletions
+                    for key in keys_to_delete:
+                        try:
+                            self._redis.delete(key)
+                        except Exception as key_error:
+                            logger.warning(f"Failed to delete key {key}: {key_error}")
 
     def _apply_ttl_to_keys(
         self,
@@ -970,17 +1076,33 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 return True
             else:
                 # For non-cluster mode, use pipeline for efficiency
-                pipeline = self._redis.pipeline()
+                try:
+                    pipeline = self._redis.pipeline()
 
-                # Set TTL for main key
-                pipeline.expire(main_key, ttl_seconds)
+                    # Set TTL for main key
+                    pipeline.expire(main_key, ttl_seconds)
 
-                # Set TTL for related keys
-                if related_keys:
-                    for key in related_keys:
-                        pipeline.expire(key, ttl_seconds)
+                    # Set TTL for related keys
+                    if related_keys:
+                        for key in related_keys:
+                            pipeline.expire(key, ttl_seconds)
 
-                return pipeline.execute()
+                    return pipeline.execute()
+                except Exception as e:
+                    logger.warning(f"Pipeline TTL setting failed: {e}. Falling back to individual TTL operations.")
+                    # Fallback to individual TTL operations
+                    try:
+                        self._redis.expire(main_key, ttl_seconds)
+                        if related_keys:
+                            for key in related_keys:
+                                try:
+                                    self._redis.expire(key, ttl_seconds)
+                                except Exception as key_error:
+                                    logger.warning(f"Failed to set TTL for key {key}: {key_error}")
+                        return True
+                    except Exception as e2:
+                        logger.error(f"Both pipeline and individual TTL operations failed: {e2}")
+                        return False
 
         return None
 
