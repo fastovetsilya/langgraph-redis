@@ -759,41 +759,35 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                     break
             return keys
         else:
-            # For cluster mode, we need to scan each node individually
-            # This is more expensive but necessary for cluster compatibility
+            # For cluster mode, use a simpler approach that works with redis-py cluster client
             all_keys = []
             try:
-                # Get cluster nodes and scan each one
-                nodes = self._redis.get_nodes()
-                for node in nodes:
-                    if node.is_replica:
-                        continue  # Skip replica nodes
-                    try:
-                        node_keys = []
-                        cursor = 0
-                        while True:
-                            cursor, batch_keys = node.redis_connection.scan(
-                                cursor, match=pattern, count=count
-                            )
-                            node_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                            if cursor == 0:
-                                break
-                        all_keys.extend(node_keys)
-                    except Exception as e:
-                        logger.warning(f"Error scanning node {node}: {e}")
-                        continue
-            except AttributeError:
-                # Fallback: try to use KEYS command (less efficient but works)
-                # Note: KEYS can be expensive on large datasets
-                logger.warning("Using KEYS command as fallback for cluster scanning")
+                # Method 1: Try using the cluster client's built-in scan_iter
+                if hasattr(self._redis, 'scan_iter'):
+                    for key in self._redis.scan_iter(match=pattern, count=count):
+                        key_str = key.decode() if isinstance(key, bytes) else key
+                        all_keys.append(key_str)
+                    return all_keys
+                
+                # Method 2: Try direct SCAN on cluster (redis-py handles routing)
+                cursor = 0
+                while True:
+                    cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=count)
+                    all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                    if cursor == 0:
+                        break
+                return all_keys
+                
+            except Exception as e:
+                logger.warning(f"Cluster SCAN failed, trying KEYS fallback: {e}")
                 try:
+                    # Fallback: use KEYS command (less efficient but works)
                     keys = self._redis.keys(pattern)
                     all_keys = [k.decode() if isinstance(k, bytes) else k for k in keys]
-                except Exception as e:
-                    logger.error(f"Failed to scan keys in cluster mode: {e}")
+                    return all_keys
+                except Exception as e2:
+                    logger.error(f"Failed to scan keys in cluster mode: {e2}")
                     return []
-            
-            return all_keys
 
 
 __all__ = [
