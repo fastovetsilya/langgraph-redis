@@ -114,44 +114,15 @@ class AsyncRedisSaver(
         """Configure the Redis client."""
         self._owns_its_client = redis_client is None
 
-        if redis_client is not None:
-            self._redis = redis_client
-        else:
-            connection_args = connection_args or {}
-            
-            # Remove cluster_mode from connection_args as it's not a Redis connection parameter
-            cluster_mode_hint = connection_args.pop('cluster_mode', None)
-            
-            # Check for SSL URL (rediss://) or cluster mode
-            is_ssl_url = redis_url and redis_url.startswith('rediss://')
-            is_cluster_mode = 'cluster' in (redis_url or '').lower() or cluster_mode_hint
-            
+        # Use direct AsyncRedis.from_url to avoid the deprecated get_async_redis_connection
+        if redis_client is None:
             if not redis_url:
                 redis_url = os.environ.get("REDIS_URL")
                 if not redis_url:
                     raise ValueError("REDIS_URL env var not set")
-            
-            # Try cluster mode for SSL URLs or explicit cluster mode
-            if is_cluster_mode or is_ssl_url:
-                try:
-                    if is_cluster_mode:
-                        self._redis = AsyncRedisCluster.from_url(redis_url, **connection_args)
-                    else:
-                        # For SSL URLs that aren't explicitly cluster mode, try cluster first
-                        try:
-                            self._redis = AsyncRedisCluster.from_url(redis_url, **connection_args)
-                        except Exception:
-                            # Fallback to standalone SSL connection
-                            self._redis = AsyncRedis.from_url(redis_url, **connection_args)
-                except Exception as e:
-                    logger.warning(f"Failed to create async cluster client from URL: {e}")
-                    # Fallback to standalone client
-                    logger.info("Falling back to standalone async Redis client")
-                    self._redis = AsyncRedis.from_url(redis_url, **{k: v for k, v in connection_args.items() if k != 'startup_nodes'})
-                    # Override cluster mode since we're using standalone
-                    self.cluster_mode = False
-            else:
-                self._redis = AsyncRedis.from_url(redis_url, **connection_args)
+            self._redis = AsyncRedis.from_url(redis_url, **(connection_args or {}))
+        else:
+            self._redis = redis_client
 
     def create_indexes(self) -> None:
         """Create indexes without connecting to Redis."""

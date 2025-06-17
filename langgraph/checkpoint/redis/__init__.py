@@ -39,8 +39,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
     _redis: Union[Redis, RedisCluster]  # Support both standalone and cluster clients
     # Whether to assume the Redis server is a cluster; None triggers auto-detection
     cluster_mode: Optional[bool] = None
-    # Store the original startup_nodes for cluster mode scanning fallback
-    _startup_nodes: List[dict[str, Any]] = []
 
     def __init__(
         self,
@@ -65,164 +63,22 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
     ) -> None:
         """Configure the Redis client."""
         self._owns_its_client = redis_client is None
-        # Reset startup nodes list on each configuration
-        self._startup_nodes = []
         
         if redis_client:
             self._redis = redis_client
         else:
             # Create Redis client without redisvl dependency
             connection_args = connection_args or {}
-            
-            # Remove cluster_mode from connection_args as it's not a Redis connection parameter
-            cluster_mode_hint = connection_args.pop('cluster_mode', None)
-            
-            # Extract password and SSL settings for later standalone node scans (if provided)
-            standalone_password = connection_args.get('password')
-            # Extract SSL configuration for cluster fallback connections
-            ssl_config = {}
-            if 'ssl' in connection_args:
-                ssl_config['ssl'] = connection_args['ssl']
-            if 'ssl_cert_reqs' in connection_args:
-                ssl_config['ssl_cert_reqs'] = connection_args['ssl_cert_reqs']
-            if 'ssl_ca_certs' in connection_args:
-                ssl_config['ssl_ca_certs'] = connection_args['ssl_ca_certs']
-            if 'ssl_certfile' in connection_args:
-                ssl_config['ssl_certfile'] = connection_args['ssl_certfile']
-            if 'ssl_keyfile' in connection_args:
-                ssl_config['ssl_keyfile'] = connection_args['ssl_keyfile']
-            
-            # Check for SSL URL (rediss://) or cluster mode
-            is_ssl_url = redis_url and redis_url.startswith('rediss://')
-            is_cluster_mode = 'cluster' in (redis_url or '').lower() or cluster_mode_hint
-            
             if redis_url:
                 # Parse URL and create appropriate client
-                if is_cluster_mode or is_ssl_url:
-                    # Ensure startup_nodes are in the correct format if provided
-                    startup_nodes = connection_args.get('startup_nodes', [])
-                    if startup_nodes and isinstance(startup_nodes[0], dict):
-                        # Convert dict format to ClusterNode format
-                        from redis.cluster import ClusterNode
-                        formatted_nodes = []
-                        for node in startup_nodes:
-                            if isinstance(node, dict) and 'host' in node and 'port' in node:
-                                # Keep dict version for fallback scans including SSL config
-                                node_config = {
-                                    'host': node['host'], 
-                                    'port': node['port'], 
-                                    'password': standalone_password
-                                }
-                                # Add SSL configuration to fallback node config
-                                node_config.update(ssl_config)
-                                self._startup_nodes.append(node_config)
-                                formatted_nodes.append(ClusterNode(node['host'], node['port']))
-                            else:
-                                formatted_nodes.append(node)
-                        connection_args['startup_nodes'] = formatted_nodes
-                    elif startup_nodes:
-                        # startup_nodes already ClusterNode instances – preserve for fallback
-                        from redis.cluster import ClusterNode
-                        for sn in startup_nodes:
-                            if isinstance(sn, ClusterNode):
-                                node_config = {
-                                    'host': sn.host, 
-                                    'port': sn.port, 
-                                    'password': standalone_password
-                                }
-                                # Add SSL configuration to fallback node config
-                                node_config.update(ssl_config)
-                                self._startup_nodes.append(node_config)
-                    elif is_ssl_url:
-                        # For SSL URLs without explicit startup_nodes, try to parse URL for host/port
-                        import urllib.parse
-                        try:
-                            parsed = urllib.parse.urlparse(redis_url)
-                            if parsed.hostname and parsed.port:
-                                node_config = {
-                                    'host': parsed.hostname,
-                                    'port': parsed.port,
-                                    'password': parsed.password or standalone_password
-                                }
-                                # For SSL URLs, ensure SSL is enabled in fallback config
-                                if is_ssl_url:
-                                    node_config['ssl'] = True
-                                    # Inherit SSL settings from connection_args
-                                    node_config.update(ssl_config)
-                                self._startup_nodes.append(node_config)
-                        except Exception as e:
-                            logger.warning(f"Failed to parse Redis URL for fallback nodes: {e}")
-                    
-                    try:
-                        if is_cluster_mode:
-                            self._redis = RedisCluster.from_url(redis_url, **connection_args)
-                        else:
-                            # For SSL URLs that aren't explicitly cluster mode, try cluster first
-                            # then fallback to standalone
-                            try:
-                                # Try as cluster first for SSL URLs
-                                self._redis = RedisCluster.from_url(redis_url, **connection_args)
-                            except Exception:
-                                # Fallback to standalone SSL connection
-                                self._redis = Redis.from_url(redis_url, **connection_args)
-                        # Test the connection
-                        self._redis.ping()
-                    except Exception as e:
-                        logger.warning(f"Failed to create cluster client from URL: {e}")
-                        # Fallback to standalone client if cluster fails
-                        logger.info("Falling back to standalone Redis client")
-                        self._redis = Redis.from_url(redis_url, **{k: v for k, v in connection_args.items() if k != 'startup_nodes'})
-                        # Override cluster mode since we're using standalone
-                        self.cluster_mode = False
+                if 'cluster' in redis_url.lower() or connection_args.get('cluster_mode'):
+                    self._redis = RedisCluster.from_url(redis_url, **connection_args)
                 else:
                     self._redis = Redis.from_url(redis_url, **connection_args)
             else:
                 # Default connection
-                if cluster_mode_hint:
-                    # For cluster mode, we need startup_nodes
-                    if 'startup_nodes' not in connection_args:
-                        connection_args['startup_nodes'] = [{'host': 'localhost', 'port': 6379}]
-                    
-                    # Preserve for fallback scans
-                    for node in connection_args['startup_nodes']:
-                        if isinstance(node, dict):
-                            node_config = {
-                                'host': node['host'], 
-                                'port': node['port'], 
-                                'password': standalone_password
-                            }
-                            # Add SSL configuration to fallback node config
-                            node_config.update(ssl_config)
-                            self._startup_nodes.append(node_config)
-                    
-                    try:
-                        self._redis = RedisCluster(**connection_args)
-                        # Test the connection
-                        self._redis.ping()
-                    except Exception as e:
-                        logger.warning(f"Failed to create cluster client: {e}")
-                        # Fallback to standalone client using first startup node
-                        if self._startup_nodes:
-                            first_node = self._startup_nodes[0]
-                            logger.info(f"Falling back to standalone Redis client at {first_node['host']}:{first_node['port']}")
-                            fallback_args = {
-                                'host': first_node['host'],
-                                'port': first_node['port'],
-                            }
-                            if first_node.get('password'):
-                                fallback_args['password'] = first_node['password']
-                            # Add SSL configuration to fallback args
-                            for ssl_key, ssl_value in ssl_config.items():
-                                if ssl_key in first_node:
-                                    fallback_args[ssl_key] = first_node[ssl_key]
-                            self._redis = Redis(**fallback_args)
-                            # Override cluster mode since we're using standalone
-                            self.cluster_mode = False
-                        else:
-                            logger.info("Falling back to default standalone Redis client")
-                            self._redis = Redis(**{k: v for k, v in connection_args.items() if k != 'startup_nodes'})
-                            # Override cluster mode since we're using standalone
-                            self.cluster_mode = False
+                if connection_args.get('cluster_mode'):
+                    self._redis = RedisCluster(**connection_args)
                 else:
                     self._redis = Redis(**connection_args)
 
@@ -245,155 +101,11 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # Determine cluster mode based on client class
         if isinstance(self._redis, RedisCluster):
-            logger.info("Redis client is a cluster client candidate, validating...")
-            if self._is_cluster_healthy():
-                logger.info("Cluster client is healthy, enabling cluster_mode")
-                self.cluster_mode = True
-                return
-            else:
-                logger.warning("Cluster client validation failed, attempting recovery with standalone client")
-                self._attempt_cluster_recovery()
-                return
+            logger.info("Redis client is a cluster client")
+            self.cluster_mode = True
         else:
             logger.info("Redis client is a standalone client")
             self.cluster_mode = False
-
-    def _attempt_cluster_recovery(self) -> None:
-        """Attempt to recover from a broken cluster client by creating a standalone client."""
-        logger.info("Attempting to recover from broken cluster client...")
-        
-        # STEP 1 ──────────────────────────────────────────────────────────
-        # Try to rebuild a brand-new RedisCluster client first.  A MOVED/ASK
-        # error often means we accidentally downgraded to a standalone client
-        # that is now talking to a cluster node.  If we can successfully
-        # recreate a healthy cluster client, we prefer that over falling back
-        # to a standalone connection.
-
-        if hasattr(self, "_startup_nodes") and self._startup_nodes:
-            for node in self._startup_nodes:
-                try:
-                    host = node.get("host")
-                    port = node.get("port")
-                    if not host or not port:
-                        continue
-
-                    logger.info(
-                        f"Attempting to recreate RedisCluster client via {host}:{port}"
-                    )
-
-                    # Build minimal args for RedisCluster
-                    cluster_args: dict[str, Any] = {
-                        "startup_nodes": [{"host": host, "port": port}],
-                        "socket_timeout": 10,
-                        "socket_connect_timeout": 10,
-                    }
-
-                    # Common optional parameters
-                    if node.get("password"):
-                        cluster_args["password"] = node["password"]
-
-                    # Propagate SSL related keys if present
-                    ssl_keys = [
-                        "ssl",
-                        "ssl_cert_reqs",
-                        "ssl_ca_certs",
-                        "ssl_certfile",
-                        "ssl_keyfile",
-                    ]
-                    for ssl_key in ssl_keys:
-                        if ssl_key in node:
-                            cluster_args[ssl_key] = node[ssl_key]
-
-                    from redis.cluster import RedisCluster
-
-                    new_cluster_client = RedisCluster(**cluster_args)
-                    # Quick health-check
-                    new_cluster_client.ping()
-
-                    logger.info(
-                        f"Successfully recreated RedisCluster client via {host}:{port}"
-                    )
-
-                    # Close previous client if we created it internally
-                    if self._owns_its_client and hasattr(self._redis, "close"):
-                        try:
-                            self._redis.close()
-                        except Exception:
-                            pass
-
-                    self._redis = new_cluster_client
-                    self.cluster_mode = True
-                    logger.info("Recovered with refreshed RedisCluster client")
-                    return  # SUCCESS – no need to try standalone
-
-                except Exception as recreate_exc:
-                    logger.warning(
-                        f"Failed to recreate RedisCluster client for {node}: {recreate_exc}"
-                    )
-                    continue
-
-        # STEP 2 ──────────────────────────────────────────────────────────
-        # If we reach here, recreating a cluster client failed.  Fall back to
-        # the original behaviour of trying a direct standalone connection.
-        logger.info("Attempting to recover from broken cluster client...")
-        
-        # Try to create a standalone client using the first startup node
-        if hasattr(self, '_startup_nodes') and self._startup_nodes:
-            for node in self._startup_nodes:
-                try:
-                    host = node.get('host')
-                    port = node.get('port')
-                    if not host or not port:
-                        continue
-                        
-                    logger.info(f"Attempting to create standalone client for {host}:{port}")
-                    
-                    # Build connection args for standalone client
-                    standalone_args = {
-                        'host': host,
-                        'port': port,
-                        'socket_timeout': 10,
-                        'socket_connect_timeout': 10,
-                    }
-                    
-                    # Add credentials if available
-                    if node.get('password'):
-                        standalone_args['password'] = node['password']
-                    
-                    # Add SSL configuration if present
-                    ssl_keys = ['ssl', 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile']
-                    for ssl_key in ssl_keys:
-                        if ssl_key in node:
-                            standalone_args[ssl_key] = node[ssl_key]
-                    
-                    # Create standalone client
-                    standalone_client = Redis(**standalone_args)
-                    
-                    # Test the connection
-                    standalone_client.ping()
-                    
-                    # If we get here, the standalone client works
-                    logger.info(f"Successfully created standalone client for {host}:{port}")
-                    
-                    # Replace the broken cluster client
-                    if self._owns_its_client and hasattr(self._redis, 'close'):
-                        try:
-                            self._redis.close()
-                        except:
-                            pass
-                    
-                    self._redis = standalone_client
-                    self.cluster_mode = False
-                    logger.info("Successfully recovered with standalone Redis client")
-                    return
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to create standalone client for {node}: {e}")
-                    continue
-        
-        # If we can't recover, at least set cluster_mode to False
-        logger.warning("Could not recover with standalone client. Treating as broken cluster client.")
-        self.cluster_mode = False
 
     def list(
         self,
@@ -426,10 +138,14 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         else:
             pattern = "checkpoint:*"
 
-        # Use cluster-safe key scanning
-        keys = self._scan_keys_cluster_safe(pattern, count=1000)
-        # Convert to bytes for consistency with original code
-        keys = [k.encode() if isinstance(k, str) else k for k in keys]
+        # Use SCAN to find matching keys
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+            keys.extend(batch_keys)
+            if cursor == 0:
+                break
         
         # Limit keys if specified
         if limit:
@@ -548,7 +264,6 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
-        _retry: bool = False,
     ) -> RunnableConfig:
         """Store a checkpoint to Redis using hash operations."""
         configurable = config["configurable"].copy()
@@ -608,177 +323,31 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             else:
                 cleaned_checkpoint_data[k] = ""
 
-        # Health-check: if we're still holding a RedisCluster client but it has become
-        # unusable (e.g. get_default_node returns None), attempt to recover by
-        # falling back to a standalone connection. This prevents errors such as
-        # "NoneType object has no attribute 'redis_connection'" that originate
-        # from redis-py internals when the cluster metadata is missing.
-        if isinstance(self._redis, RedisCluster) and not self._is_cluster_healthy():
-            logger.warning(
-                "Detected unhealthy RedisCluster client during put(); attempting recovery with standalone client."
-            )
-            self._attempt_cluster_recovery()
+        # Store as Redis hash
+        self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
 
-        # Store checkpoint and blob data based on cluster mode
+        # Store blob values
+        blobs = self._dump_blobs(
+            storage_safe_thread_id,
+            storage_safe_checkpoint_ns,
+            copy.get("channel_values", {}),
+            new_versions,
+        )
+
         blob_keys = []
-        
-        # Enhanced cluster mode detection - check if we're actually on a cluster
-        actual_cluster_mode = self.cluster_mode and self._is_cluster_healthy()
-        if not actual_cluster_mode:
-            # Optionally try to detect cluster if not already enabled
-            try:
-                if hasattr(self._redis, 'cluster'):
-                    self._redis.cluster('info')
-                    if self._is_cluster_healthy():
-                        actual_cluster_mode = True
-                        logger.info("Detected healthy Redis cluster via cluster info command, enabling cluster mode")
-            except Exception:
-                pass
-        
-        if actual_cluster_mode:
-            # For cluster mode, handle operations individually
-            self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
+        for blob_key, blob_data in blobs:
+            # Clean blob_data to ensure no None values
+            cleaned_blob_data = {}
+            for k, v in blob_data.items():
+                if v is not None:
+                    cleaned_blob_data[k] = v
+                else:
+                    # Convert None to empty string for Redis compatibility
+                    cleaned_blob_data[k] = ""
             
-            # Store blob values individually
-            blobs = self._dump_blobs(
-                storage_safe_thread_id,
-                storage_safe_checkpoint_ns,
-                copy.get("channel_values", {}),
-                new_versions,
-            )
-
-            for blob_key, blob_data in blobs:
-                # Clean blob_data to ensure no None values
-                cleaned_blob_data = {}
-                for k, v in blob_data.items():
-                    if v is not None:
-                        cleaned_blob_data[k] = v
-                    else:
-                        # Convert None to empty string for Redis compatibility
-                        cleaned_blob_data[k] = ""
-                
-                # Store blob as hash
-                self._redis.hset(blob_key, mapping=cleaned_blob_data)
-                blob_keys.append(blob_key)
-        else:
-            # For non-cluster mode, use pipeline for efficiency
-            try:
-                pipeline = self._redis.pipeline()
-                
-                # Store checkpoint data as hash
-                pipeline.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
-
-                # Store blob values
-                blobs = self._dump_blobs(
-                    storage_safe_thread_id,
-                    storage_safe_checkpoint_ns,
-                    copy.get("channel_values", {}),
-                    new_versions,
-                )
-
-                for blob_key, blob_data in blobs:
-                    # Clean blob_data to ensure no None values
-                    cleaned_blob_data = {}
-                    for k, v in blob_data.items():
-                        if v is not None:
-                            cleaned_blob_data[k] = v
-                        else:
-                            # Convert None to empty string for Redis compatibility
-                            cleaned_blob_data[k] = ""
-                    
-                    # Store blob as hash
-                    pipeline.hset(blob_key, mapping=cleaned_blob_data)
-                    blob_keys.append(blob_key)
-                
-                pipeline.execute()
-                
-            except Exception as e:
-                logger.warning(f"Pipeline execution failed: {e}. Falling back to individual operations.")
-                
-                # Detect Redis cluster redirection errors (MOVED / ASK). These
-                # indicate that we're talking to a cluster node with a non-cluster
-                # client.  Attempt to rebuild a proper RedisCluster client and
-                # retry the write once.
-                err_msg = str(e)
-                if "MOVED" in err_msg or "ASK" in err_msg:
-                    logger.warning(
-                        f"Redis redirection error detected ({err_msg}). Initiating cluster recovery and retry."
-                    )
-
-                    # Force cluster mode so subsequent logic follows the cluster path
-                    self.cluster_mode = True
-                    try:
-                        self._attempt_cluster_recovery()
-                        # Retry the put only if we have not retried before
-                        if not _retry:
-                            return self.put(
-                                config, checkpoint, metadata, new_versions, _retry=True
-                            )
-                    except Exception as recovery_exc:
-                        logger.error(
-                            f"Cluster recovery failed after redirection error: {recovery_exc}"
-                        )
-                        raise recovery_exc
-
-                # Fallback to individual operations if pipeline fails
-                try:
-                    # Store checkpoint data as hash
-                    self._redis.hset(checkpoint_key, mapping=cleaned_checkpoint_data)
-
-                    # Store blob values individually
-                    blobs = self._dump_blobs(
-                        storage_safe_thread_id,
-                        storage_safe_checkpoint_ns,
-                        copy.get("channel_values", {}),
-                        new_versions,
-                    )
-
-                    for blob_key, blob_data in blobs:
-                        # Clean blob_data to ensure no None values
-                        cleaned_blob_data = {}
-                        for k, v in blob_data.items():
-                            if v is not None:
-                                cleaned_blob_data[k] = v
-                            else:
-                                # Convert None to empty string for Redis compatibility
-                                cleaned_blob_data[k] = ""
-                        
-                        # Store blob as hash
-                        self._redis.hset(blob_key, mapping=cleaned_blob_data)
-                        blob_keys.append(blob_key)
-                        
-                except Exception as e2:
-                    # Detect Redis cluster redirection errors (MOVED / ASK). These
-                    # indicate that we're talking to a cluster node with a non-cluster
-                    # client.  Attempt to rebuild a proper RedisCluster client and
-                    # retry the write once.
-                    err_msg = str(e2)
-                    if "MOVED" in err_msg or "ASK" in err_msg:
-                        logger.warning(
-                            f"Redis redirection error detected ({err_msg}). Initiating cluster recovery and retry."
-                        )
-
-                        # Force cluster mode so subsequent logic follows the cluster path
-                        self.cluster_mode = True
-                        try:
-                            self._attempt_cluster_recovery()
-                            # Retry the put only if we have not retried before
-                            if not _retry:
-                                return self.put(
-                                    config,
-                                    checkpoint,
-                                    metadata,
-                                    new_versions,
-                                    _retry=True,
-                                )
-                        except Exception as recovery_exc:
-                            logger.error(
-                                f"Cluster recovery failed after redirection error: {recovery_exc}"
-                            )
-                            raise recovery_exc
-
-                    logger.error(f"Both pipeline and individual operations failed: {e2}")
-                    raise
+            # Store blob as hash
+            self._redis.hset(blob_key, mapping=cleaned_blob_data)
+            blob_keys.append(blob_key)
 
         # Apply TTL to checkpoint and blob keys if configured
         if self.ttl_config and "default_ttl" in self.ttl_config:
@@ -805,12 +374,16 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 return None
                 
         else:
-            # Get latest checkpoint for thread using cluster-safe scanning
+            # Get latest checkpoint for thread
             pattern = f"checkpoint:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:*"
             
-            keys = self._scan_keys_cluster_safe(pattern, count=1000)
-            # Convert to bytes for consistency
-            keys = [k.encode() if isinstance(k, str) else k for k in keys]
+            keys = []
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+                keys.extend(batch_keys)
+                if cursor == 0:
+                    break
             
             if not keys:
                 return None
@@ -837,19 +410,27 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
 
         # If refresh_on_read is enabled, refresh TTL
         if self.ttl_config and self.ttl_config.get("refresh_on_read"):
-            # Get related blob and write keys using cluster-safe scanning
+            # Get related blob and write keys
             blob_pattern = f"checkpoint_blob:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:*"
             write_pattern = f"checkpoint_write:{to_storage_safe_id(doc_thread_id)}:{to_storage_safe_str(doc_checkpoint_ns)}:{to_storage_safe_id(doc_checkpoint_id)}:*"
             
             all_keys = [checkpoint_key]
             
-            # Get blob keys using cluster-safe scanning
-            blob_keys = self._scan_keys_cluster_safe(blob_pattern, count=1000)
-            all_keys.extend(blob_keys)
+            # Get blob keys
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=blob_pattern, count=1000)
+                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
                     
-            # Get write keys using cluster-safe scanning
-            write_keys = self._scan_keys_cluster_safe(write_pattern, count=1000)
-            all_keys.extend(write_keys)
+            # Get write keys  
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=write_pattern, count=1000)
+                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
 
             # Apply TTL to all related keys
             if len(all_keys) > 1:
@@ -1001,12 +582,16 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         parent_checkpoint_id: str,
     ) -> List[Tuple[str, bytes]]:
         """Load pending sends for a parent checkpoint using basic Redis operations."""
-        # Find write keys for parent checkpoint with TASKS channel using cluster-safe scanning
+        # Find write keys for parent checkpoint with TASKS channel
         pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(parent_checkpoint_id)}:*"
         
-        keys = self._scan_keys_cluster_safe(pattern, count=1000)
-        # Convert to bytes for consistency
-        keys = [k.encode() if isinstance(k, str) else k for k in keys]
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+            keys.extend(batch_keys)
+            if cursor == 0:
+                break
 
         # Filter for TASKS channel and collect writes
         writes = []
@@ -1038,12 +623,16 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         if checkpoint_id is None:
             return []
 
-        # Find write keys for this checkpoint using cluster-safe scanning
+        # Find write keys for this checkpoint
         pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(checkpoint_id)}:*"
         
-        keys = self._scan_keys_cluster_safe(pattern, count=1000)
-        # Convert to bytes for consistency
-        keys = [k.encode() if isinstance(k, str) else k for k in keys]
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+            keys.extend(batch_keys)
+            if cursor == 0:
+                break
 
         # Collect writes data
         writes_dict = {}
@@ -1072,7 +661,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         """Delete all checkpoints and writes associated with a specific thread ID."""
         storage_safe_thread_id = to_storage_safe_id(thread_id)
 
-        # Collect all keys to delete using cluster-safe scanning
+        # Collect all keys to delete
         patterns = [
             f"checkpoint:{storage_safe_thread_id}:*",
             f"checkpoint_blob:{storage_safe_thread_id}:*", 
@@ -1081,220 +670,25 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         
         keys_to_delete = []
         for pattern in patterns:
-            pattern_keys = self._scan_keys_cluster_safe(pattern, count=1000)
-            keys_to_delete.extend(pattern_keys)
+            cursor = 0
+            while True:
+                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
+                keys_to_delete.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
+                if cursor == 0:
+                    break
 
         # Execute deletions based on cluster mode
         if keys_to_delete:
-            # Validate cluster mode before using cluster operations
-            use_cluster_mode = self.cluster_mode
-            if use_cluster_mode:
-                try:
-                    # Validate cluster client is working before using individual operations
-                    if hasattr(self._redis, 'get_default_node'):
-                        default_node = self._redis.get_default_node()
-                        if default_node is None or not hasattr(default_node, 'redis_connection'):
-                            logger.warning("Cluster validation failed in delete_thread. Using pipeline mode.")
-                            use_cluster_mode = False
-                except Exception as e:
-                    logger.warning(f"Cluster validation failed in delete_thread: {e}. Using pipeline mode.")
-                    use_cluster_mode = False
-            
-            if use_cluster_mode:
+            if self.cluster_mode:
                 # For cluster mode, delete keys individually
                 for key in keys_to_delete:
                     self._redis.delete(key)
             else:
                 # For non-cluster mode, use pipeline for efficiency
-                try:
-                    pipeline = self._redis.pipeline()
-                    for key in keys_to_delete:
-                        pipeline.delete(key)
-                    pipeline.execute()
-                except Exception as e:
-                    logger.warning(f"Pipeline deletion failed: {e}. Falling back to individual deletions.")
-                    # Fallback to individual deletions
-                    for key in keys_to_delete:
-                        try:
-                            self._redis.delete(key)
-                        except Exception as key_error:
-                            logger.warning(f"Failed to delete key {key}: {key_error}")
-
-    def _apply_ttl_to_keys(
-        self,
-        main_key: str,
-        related_keys: Optional[List[str]] = None,
-        ttl_minutes: Optional[float] = None,
-    ) -> Any:
-        """Apply Redis native TTL to keys.
-
-        Args:
-            main_key: The primary Redis key
-            related_keys: Additional Redis keys that should expire at the same time
-            ttl_minutes: Time-to-live in minutes, overrides default_ttl if provided
-
-        Returns:
-            Result of the Redis operation
-        """
-        if ttl_minutes is None:
-            # Check if there's a default TTL in config
-            if self.ttl_config and "default_ttl" in self.ttl_config:
-                ttl_minutes = self.ttl_config.get("default_ttl")
-
-        if ttl_minutes is not None:
-            ttl_seconds = int(ttl_minutes * 60)
-
-            # Validate cluster mode before using cluster operations
-            use_cluster_mode = self.cluster_mode
-            if use_cluster_mode:
-                try:
-                    # Validate cluster client is working before using individual operations
-                    if hasattr(self._redis, 'get_default_node'):
-                        default_node = self._redis.get_default_node()
-                        if default_node is None or not hasattr(default_node, 'redis_connection'):
-                            logger.warning("Cluster validation failed in _apply_ttl_to_keys. Using pipeline mode.")
-                            use_cluster_mode = False
-                except Exception as e:
-                    logger.warning(f"Cluster validation failed in _apply_ttl_to_keys: {e}. Using pipeline mode.")
-                    use_cluster_mode = False
-
-            if use_cluster_mode:
-                # For cluster mode, execute TTL operations individually
-                self._redis.expire(main_key, ttl_seconds)
-
-                if related_keys:
-                    for key in related_keys:
-                        self._redis.expire(key, ttl_seconds)
-
-                return True
-            else:
-                # For non-cluster mode, use pipeline for efficiency
-                try:
-                    pipeline = self._redis.pipeline()
-
-                    # Set TTL for main key
-                    pipeline.expire(main_key, ttl_seconds)
-
-                    # Set TTL for related keys
-                    if related_keys:
-                        for key in related_keys:
-                            pipeline.expire(key, ttl_seconds)
-
-                    return pipeline.execute()
-                except Exception as e:
-                    logger.warning(f"Pipeline TTL setting failed: {e}. Falling back to individual TTL operations.")
-                    # Fallback to individual TTL operations
-                    try:
-                        self._redis.expire(main_key, ttl_seconds)
-                        if related_keys:
-                            for key in related_keys:
-                                try:
-                                    self._redis.expire(key, ttl_seconds)
-                                except Exception as key_error:
-                                    logger.warning(f"Failed to set TTL for key {key}: {key_error}")
-                        return True
-                    except Exception as e2:
-                        logger.error(f"Both pipeline and individual TTL operations failed: {e2}")
-                        return False
-
-        return None
-
-    def _scan_keys_cluster_safe(self, pattern: str, count: int = 1000) -> List[str]:
-        """Scan for keys in a cluster-safe way."""
-        if not self.cluster_mode:
-            # Use regular SCAN for non-cluster mode
-            keys = []
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=count)
-                keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
-            return keys
-        else:
-            # For cluster mode, use a simpler approach that works with redis-py cluster client
-            all_keys: List[str] = []
-            try:
-                # Method 1: Try using the cluster client's built-in scan_iter
-                if hasattr(self._redis, 'scan_iter'):
-                    for key in self._redis.scan_iter(match=pattern, count=count):
-                        key_str = key.decode() if isinstance(key, bytes) else key
-                        all_keys.append(key_str)
-                    return all_keys
-                
-                # Method 2: Try direct SCAN on cluster (redis-py handles routing)
-                cursor = 0
-                while True:
-                    cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=count)
-                    all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                    if cursor == 0:
-                        break
-                return all_keys
-                
-            except Exception as e:
-                logger.warning(f"Cluster SCAN failed, trying KEYS fallback: {e}")
-                try:
-                    # Fallback: use KEYS command (less efficient but works)
-                    keys = self._redis.keys(pattern)
-                    all_keys = [k.decode() if isinstance(k, bytes) else k for k in keys]
-                    return all_keys
-                except Exception as e2:
-                    logger.warning(f"KEYS fallback failed: {e2}. Trying per-startup-node scan")
-
-                    # Final fallback: iterate over original startup nodes with standalone connections
-                    aggregated: list[str] = []
-                    for node in getattr(self, "_startup_nodes", []):
-                        try:
-                            host = node.get("host")
-                            port = node.get("port")
-                            pwd = node.get("password")
-                            if not host or not port:
-                                continue
-                            
-                            # Build connection args including SSL settings
-                            standalone_args = {
-                                'host': host,
-                                'port': port,
-                                'socket_timeout': 2
-                            }
-                            if pwd:
-                                standalone_args['password'] = pwd
-                            
-                            # Add SSL configuration if present in node config
-                            ssl_keys = ['ssl', 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile']
-                            for ssl_key in ssl_keys:
-                                if ssl_key in node:
-                                    standalone_args[ssl_key] = node[ssl_key]
-                            
-                            standalone_client = Redis(**standalone_args)
-                            cursor_inner = 0
-                            while True:
-                                cursor_inner, bkeys = standalone_client.scan(cursor_inner, match=pattern, count=count)
-                                aggregated.extend([k.decode() if isinstance(k, bytes) else k for k in bkeys])
-                                if cursor_inner == 0:
-                                    break
-                            standalone_client.close()
-                        except Exception as node_exc:
-                            logger.debug(f"Node scan error on {node}: {node_exc}")
-                            continue
-                    return aggregated
-
-    def _is_cluster_healthy(self) -> bool:
-        """Check if the current RedisCluster client appears usable."""
-        if not isinstance(self._redis, RedisCluster):
-            return False
-        try:
-            if hasattr(self._redis, 'get_default_node'):
-                node = self._redis.get_default_node()
-                if node is None:
-                    return False
-                if getattr(node, 'redis_connection', None) is None:
-                    return False
-            # simple ping
-            self._redis.ping()
-            return True
-        except Exception:
-            return False
+                pipeline = self._redis.pipeline()
+                for key in keys_to_delete:
+                    pipeline.delete(key)
+                pipeline.execute()
 
 
 __all__ = [

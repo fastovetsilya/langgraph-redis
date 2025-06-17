@@ -26,26 +26,7 @@ def test_chat_memory_functionality():
     
     redis_url = "redis://localhost:6379"
     
-    # Add cluster mode support - detect from environment or default to standalone
-    cluster_mode = os.getenv("REDIS_CLUSTER_MODE", "false").lower() == "true"
-    connection_args = {}
-    
-    if cluster_mode:
-        print("🧪 Testing RedisSaver with Redis CLUSTER mode...")
-        # For cluster mode, modify the URL or add cluster connection args
-        redis_url = os.getenv("REDIS_CLUSTER_URL", "redis://localhost:7000")
-        connection_args = {
-            "cluster_mode": True,
-            "startup_nodes": [
-                {"host": "localhost", "port": 7000},
-                {"host": "localhost", "port": 7001}, 
-                {"host": "localhost", "port": 7002}
-            ]
-        }
-        # Use connection_args instead of URL for cluster
-        redis_url = None
-    else:
-        print("🧪 Testing RedisSaver with Redis STANDALONE mode...")
+    print("🧪 Testing RedisSaver with actual chat agent...")
     
     # Check for Anthropic API key
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -66,8 +47,8 @@ def test_chat_memory_functionality():
         # Create tools
         tools = [get_weather]
         
-        # Create RedisSaver with cluster support
-        with RedisSaver.from_conn_string(redis_url, connection_args=connection_args) as checkpointer:
+        # Create RedisSaver
+        with RedisSaver.from_conn_string(redis_url) as checkpointer:
             checkpointer.setup()
             print("✅ Created RedisSaver checkpointer")
             
@@ -218,26 +199,7 @@ def test_concurrent_threads():
     
     redis_url = "redis://localhost:6379"
     
-    # Add cluster mode support - detect from environment or default to standalone
-    cluster_mode = os.getenv("REDIS_CLUSTER_MODE", "false").lower() == "true"
-    connection_args = {}
-    
-    if cluster_mode:
-        print("\n🧪 Testing concurrent thread functionality with Redis CLUSTER mode...")
-        # For cluster mode, modify the URL or add cluster connection args
-        redis_url = os.getenv("REDIS_CLUSTER_URL", "redis://localhost:7000")
-        connection_args = {
-            "cluster_mode": True,
-            "startup_nodes": [
-                {"host": "localhost", "port": 7000},
-                {"host": "localhost", "port": 7001}, 
-                {"host": "localhost", "port": 7002}
-            ]
-        }
-        # Use connection_args instead of URL for cluster
-        redis_url = None
-    else:
-        print("\n🧪 Testing concurrent thread functionality with Redis STANDALONE mode...")
+    print("\n🧪 Testing concurrent thread functionality...")
     
     # Check for Anthropic API key
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -253,7 +215,7 @@ def test_concurrent_threads():
         )
         tools = [get_weather]
         
-        with RedisSaver.from_conn_string(redis_url, connection_args=connection_args) as checkpointer:
+        with RedisSaver.from_conn_string(redis_url) as checkpointer:
             checkpointer.setup()
             
             agent = create_react_agent(llm, tools, checkpointer=checkpointer)
@@ -328,36 +290,12 @@ def test_concurrent_threads():
 if __name__ == "__main__":
     print("🚀 Starting comprehensive RedisSaver chat tests...\n")
     
-    # Print cluster mode instructions
-    cluster_mode = os.getenv("REDIS_CLUSTER_MODE", "false").lower() == "true"
-    if cluster_mode:
-        print("🔧 Running in CLUSTER mode!")
-        print("   Make sure your Redis cluster is running on ports 7000-7002")
-        print("   To test standalone mode: unset REDIS_CLUSTER_MODE")
-    else:
-        print("🔧 Running in STANDALONE mode!")
-        print("   Make sure Redis is running on localhost:6379")
-        print("   To test cluster mode: export REDIS_CLUSTER_MODE=true")
-    print()
-    
     success1 = test_chat_memory_functionality()
     success2 = test_concurrent_threads()
     
     if success1 and success2:
         print("\n🎉 All tests passed! RedisSaver works perfectly with chat agents.")
-        if cluster_mode:
-            print("✅ CLUSTER mode compatibility confirmed - no more MOVED errors!")
-        else:
-            print("✅ STANDALONE mode working as expected!")
         exit(0)
     else:
         print("\n❌ Some tests failed!")
-        print("\n📋 Troubleshooting:")
-        if cluster_mode:
-            print("   - Check if Redis cluster is running and accessible")
-            print("   - Verify cluster nodes are on ports 7000, 7001, 7002")
-            print("   - Try standalone mode: unset REDIS_CLUSTER_MODE")
-        else:
-            print("   - Check if Redis is running on localhost:6379")
-            print("   - Try: redis-server --port 6379")
         exit(1) 
