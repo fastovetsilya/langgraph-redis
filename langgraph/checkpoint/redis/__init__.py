@@ -532,6 +532,17 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             else:
                 cleaned_checkpoint_data[k] = ""
 
+        # Health-check: if we're still holding a RedisCluster client but it has become
+        # unusable (e.g. get_default_node returns None), attempt to recover by
+        # falling back to a standalone connection. This prevents errors such as
+        # "NoneType object has no attribute 'redis_connection'" that originate
+        # from redis-py internals when the cluster metadata is missing.
+        if isinstance(self._redis, RedisCluster) and not self._is_cluster_healthy():
+            logger.warning(
+                "Detected unhealthy RedisCluster client during put(); attempting recovery with standalone client."
+            )
+            self._attempt_cluster_recovery()
+
         # Store checkpoint and blob data based on cluster mode
         blob_keys = []
         
