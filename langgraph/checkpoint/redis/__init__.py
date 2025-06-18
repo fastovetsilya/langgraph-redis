@@ -113,7 +113,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             # For non-cluster mode, use regular SCAN
             cursor = 0
             while True:
-                cursor, keys = self._redis.scan(cursor, match=pattern, count=count)
+                cursor, keys = self._redis.scan(cursor=cursor, match=pattern, count=count)
                 for key in keys:
                     yield key
                 if cursor == 0:
@@ -129,7 +129,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                             cursor = 0
                             while True:
                                 cursor, keys = node.redis_connection.scan(
-                                    cursor, match=pattern, count=count
+                                    cursor=cursor, match=pattern, count=count
                                 )
                                 for key in keys:
                                     yield key
@@ -144,7 +144,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
                 cursor = 0
                 while True:
                     try:
-                        cursor, keys = self._redis.scan(cursor, match=pattern, count=count)
+                        cursor, keys = self._redis.scan(cursor=cursor, match=pattern, count=count)
                         for key in keys:
                             yield key
                         if cursor == 0:
