@@ -107,6 +107,52 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             logger.info("Redis client is a standalone client")
             self.cluster_mode = False
 
+    def _cluster_scan_iter(self, pattern: str, count: int = 1000) -> Iterator[bytes]:
+        """Cluster-aware SCAN operation that handles MOVED errors properly."""
+        if not self.cluster_mode:
+            # For non-cluster mode, use regular SCAN
+            cursor = 0
+            while True:
+                cursor, keys = self._redis.scan(cursor, match=pattern, count=count)
+                for key in keys:
+                    yield key
+                if cursor == 0:
+                    break
+        else:
+            # For cluster mode, scan all nodes individually
+            try:
+                # Get all cluster nodes
+                nodes = self._redis.get_nodes()
+                for node in nodes:
+                    if node.server_type == 'primary':  # Only scan primary nodes
+                        try:
+                            cursor = 0
+                            while True:
+                                cursor, keys = node.redis_connection.scan(
+                                    cursor, match=pattern, count=count
+                                )
+                                for key in keys:
+                                    yield key
+                                if cursor == 0:
+                                    break
+                        except Exception as e:
+                            logger.warning(f"Error scanning node {node}: {e}")
+                            continue
+            except AttributeError:
+                # Fallback for older redis-py versions or different cluster client implementations
+                logger.warning("Using fallback cluster scan method")
+                cursor = 0
+                while True:
+                    try:
+                        cursor, keys = self._redis.scan(cursor, match=pattern, count=count)
+                        for key in keys:
+                            yield key
+                        if cursor == 0:
+                            break
+                    except Exception as e:
+                        logger.warning(f"Cluster scan error: {e}")
+                        break
+
     def list(
         self,
         config: Optional[RunnableConfig],
@@ -115,42 +161,41 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         before: Optional[RunnableConfig] = None,
         limit: Optional[int] = None,
     ) -> Iterator[CheckpointTuple]:
-        """List checkpoints from Redis using basic key operations."""
+        """List checkpoints from Redis using cluster-aware key operations."""
         # Build search pattern
         thread_id = None
-        checkpoint_ns = ""
+        checkpoint_ns = None
         
         if config:
             thread_id = config["configurable"]["thread_id"]
-            checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
-            # Note: For list operations, we typically want all checkpoints for a thread,
-            # regardless of any checkpoint_id in the config
+            # For list operations, only use checkpoint_ns if explicitly provided
+            # If not provided, we want ALL checkpoints for the thread regardless of namespace
+            checkpoint_ns = config["configurable"].get("checkpoint_ns")
 
         # Create key pattern
         if thread_id:
-            pattern_parts = [
-                "checkpoint",
-                to_storage_safe_id(thread_id),
-                to_storage_safe_str(checkpoint_ns),
-                "*"  # Always use wildcard for listing all checkpoints in thread
-            ]
-            pattern = ":".join(pattern_parts)
+            if checkpoint_ns is not None:
+                # Specific namespace requested
+                pattern_parts = [
+                    "checkpoint",
+                    to_storage_safe_id(thread_id),
+                    to_storage_safe_str(checkpoint_ns),
+                    "*"  # Always use wildcard for listing all checkpoints in thread/namespace
+                ]
+                pattern = ":".join(pattern_parts)
+            else:
+                # All namespaces for this thread
+                pattern = f"checkpoint:{to_storage_safe_id(thread_id)}:*"
         else:
             pattern = "checkpoint:*"
 
-        # Use SCAN to find matching keys
+        # Use cluster-aware SCAN to find matching keys
         keys = []
-        cursor = 0
-        while True:
-            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-            keys.extend(batch_keys)
-            if cursor == 0:
+        for key_bytes in self._cluster_scan_iter(pattern, count=1000):
+            keys.append(key_bytes)
+            if limit and len(keys) >= limit:
                 break
         
-        # Limit keys if specified
-        if limit:
-            keys = keys[:limit]
-
         # Process each key
         for key_bytes in keys:
             key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
@@ -378,12 +423,8 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             pattern = f"checkpoint:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:*"
             
             keys = []
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-                keys.extend(batch_keys)
-                if cursor == 0:
-                    break
+            for key_bytes in self._cluster_scan_iter(pattern, count=1000):
+                keys.append(key_bytes)
             
             if not keys:
                 return None
@@ -416,21 +457,13 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
             
             all_keys = [checkpoint_key]
             
-            # Get blob keys
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=blob_pattern, count=1000)
-                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
+            # Get blob keys using cluster-aware scan
+            for key_bytes in self._cluster_scan_iter(blob_pattern, count=1000):
+                all_keys.append(key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes)
                     
-            # Get write keys  
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=write_pattern, count=1000)
-                all_keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
+            # Get write keys using cluster-aware scan
+            for key_bytes in self._cluster_scan_iter(write_pattern, count=1000):
+                all_keys.append(key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes)
 
             # Apply TTL to all related keys
             if len(all_keys) > 1:
@@ -581,17 +614,13 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         checkpoint_ns: str,
         parent_checkpoint_id: str,
     ) -> List[Tuple[str, bytes]]:
-        """Load pending sends for a parent checkpoint using basic Redis operations."""
+        """Load pending sends for a parent checkpoint using cluster-aware Redis operations."""
         # Find write keys for parent checkpoint with TASKS channel
         pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(parent_checkpoint_id)}:*"
         
         keys = []
-        cursor = 0
-        while True:
-            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-            keys.extend(batch_keys)
-            if cursor == 0:
-                break
+        for key_bytes in self._cluster_scan_iter(pattern, count=1000):
+            keys.append(key_bytes)
 
         # Filter for TASKS channel and collect writes
         writes = []
@@ -619,7 +648,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
     def _load_pending_writes(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: str
     ) -> List[Any]:
-        """Load pending writes using basic Redis operations."""
+        """Load pending writes using cluster-aware Redis operations."""
         if checkpoint_id is None:
             return []
 
@@ -627,12 +656,8 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         pattern = f"checkpoint_write:{to_storage_safe_id(thread_id)}:{to_storage_safe_str(checkpoint_ns)}:{to_storage_safe_id(checkpoint_id)}:*"
         
         keys = []
-        cursor = 0
-        while True:
-            cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-            keys.extend(batch_keys)
-            if cursor == 0:
-                break
+        for key_bytes in self._cluster_scan_iter(pattern, count=1000):
+            keys.append(key_bytes)
 
         # Collect writes data
         writes_dict = {}
@@ -658,7 +683,7 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         return BaseRedisSaver._load_writes(self.serde, writes_dict)
 
     def delete_thread(self, thread_id: str) -> None:
-        """Delete all checkpoints and writes associated with a specific thread ID."""
+        """Delete all checkpoints and writes associated with a specific thread ID using cluster-aware operations."""
         storage_safe_thread_id = to_storage_safe_id(thread_id)
 
         # Collect all keys to delete
@@ -670,12 +695,8 @@ class RedisSaver(BaseRedisSaver[Union[Redis, RedisCluster], None]):
         
         keys_to_delete = []
         for pattern in patterns:
-            cursor = 0
-            while True:
-                cursor, batch_keys = self._redis.scan(cursor, match=pattern, count=1000)
-                keys_to_delete.extend([k.decode() if isinstance(k, bytes) else k for k in batch_keys])
-                if cursor == 0:
-                    break
+            for key_bytes in self._cluster_scan_iter(pattern, count=1000):
+                keys_to_delete.append(key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes)
 
         # Execute deletions based on cluster mode
         if keys_to_delete:
